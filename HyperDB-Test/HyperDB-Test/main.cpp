@@ -6,6 +6,9 @@
 #include <string>
 #include <chrono>
 #include <random>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
 
 // the "idc - dev" timer
 struct Timer {
@@ -28,6 +31,16 @@ std::string fast_noise(size_t len, std::mt19937& rng) {
     return s;
 }
 
+std::string get_time_stamp() {
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm bt;
+    localtime_s(&bt, &in_time_t);
+    std::stringstream ss;
+    ss << std::put_time(&bt, "[%I:%M%p]");
+    return ss.str();
+}
+
 void wait_for_queue(HyperDBCluster& cluster) {
     while (!cluster.IsQueueEmpty()) {
         std::this_thread::yield();
@@ -44,8 +57,8 @@ int main() {
     const int TOTAL_ROWS = 10000000;
 
     std::cout << "--- STARTING 10,000,000 ROW APOCALYPSE ---" << std::endl;
-    std::cout << "[6:30PM] target: 3.8GB of raw encrypted entropy." << std::endl;
-    std::cout << "[6:30PM] shard limit: 512MB. pray for the manifest." << std::endl;
+    std::cout << get_time_stamp() << " target: 3.8GB of raw encrypted entropy." << std::endl;
+    std::cout << get_time_stamp() << " shard limit: 512MB. pray for the manifest." << std::endl;
 
     try {
         Timer total_timer;
@@ -59,6 +72,7 @@ int main() {
         wait_for_queue(cluster);
 
         Timer loop_timer;
+        Timer lap_timer;
         for (int i = 1; i <= TOTAL_ROWS; ++i) {
             cluster.QueueWrite("death", {
                 {"noise1", fast_noise(128, rng)},
@@ -69,7 +83,10 @@ int main() {
             // check memory sanity every 1M rows
             if (i % 1000000 == 0) {
                 double pct = (static_cast<double>(i) / TOTAL_ROWS) * 100.0;
-                std::cout << "  > progress: " << (int)pct << "% (" << i << " rows queued)..." << std::endl;
+                double lap_time = lap_timer.elapsed_seconds();
+                std::cout << "  > progress: " << (int)pct << "% (" << i << " rows queued). Last 1M took: " << lap_time << "s" << std::endl;
+                lap_timer = Timer(); // restart lap timer for next mill
+
 
                 // wait for background thread to catch up so we don't hit 32GB ram limit
                 // if we don't do this, the std::queue will swallow your entire OS.
@@ -79,7 +96,7 @@ int main() {
         }
 
         double loop_time = loop_timer.elapsed_seconds();
-        std::cout << "[6:XXPM] loop finished in " << loop_time << "s. flushing remaining data..." << std::endl;
+        std::cout << get_time_stamp() << " loop finished in " << loop_time << "s. flushing remaining data..." << std::endl;
 
         Timer flush_timer;
         cluster.ForceFlush(58253); // the magic iteration count
