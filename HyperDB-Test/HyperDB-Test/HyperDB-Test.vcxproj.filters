@@ -1,0 +1,129 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Quelldateien">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Headerdateien">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Ressourcendateien">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\HyperDB.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\hyperdb_generated.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\allocator.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\array.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\base.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\buffer.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\buffer_ref.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\code_generator.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\code_generators.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\default_allocator.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\detached_buffer.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\file_manager.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\flatbuffer_builder.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\flatbuffers.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\flatc.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\flex_flat_util.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\flexbuffers.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\grpc.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\hash.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\idl.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\minireflect.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\reflection.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\reflection_generated.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\registry.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\stl_emulation.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\string.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\struct.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\table.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\util.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\vector.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\vector_downward.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\verifier.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\pch\flatc_pch.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="include\flatbuffers\pch\pch.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Library Include="include\lib\HyperDB.lib" />
+  </ItemGroup>
+</Project>
