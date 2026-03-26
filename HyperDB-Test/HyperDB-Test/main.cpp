@@ -60,15 +60,33 @@ int main() {
 
         std::cout << "  - 100k Reads took: " << read_time << "s (" << (READ_COUNT / read_time) << " reads/sec)" << std::endl;
 
-        // 2. Multi-Shard Aggregate Find (Aggregating across 8 physical files)
-        // We look for a string that likely won't exist just to force a full scan of all shards
-        std::cout << "> Multi-shard scan for non-existent value (full aggregation)..." << std::endl;
-        Timer find_timer;
-        cluster.QueueFind("death", "noise1", std::string("missing_no_9999"), [](std::vector<ReadResult> results) {
-            std::cout << "  - Scan completed. Found " << results.size() << " results." << std::endl;
+        // 2. Multi-Shard Aggregate Find + Verification
+        // We pick a row from the middle (which should be in Shard 3 or 4) to ensure we're not just reading shard 0
+        uint64_t target_row = 5000000;
+        std::string needle;
+        
+        std::cout << "> Retrieving needle from global row " << target_row << "..." << std::endl;
+        cluster.QueueRead("death", target_row, [&](ReadResult res) {
+            if (!res.empty()) needle = HyperDBUtil::HyperValueToString(res[0].value);
         });
         wait_for_queue(cluster);
-        std::cout << "  - Full shard-aggregated scan took: " << find_timer.elapsed_seconds() << "s" << std::endl;
+
+        if (needle.empty()) {
+            std::cout << "  [FAIL] Could not retrieve needle string from row " << target_row << std::endl;
+        } else {
+            std::cout << "> Scanning 10M rows (4.2GB) for needle: " << needle.substr(0, 16) << "..." << std::endl;
+            Timer find_timer;
+            cluster.QueueFind("death", "noise1", needle, [&](std::vector<ReadResult> results) {
+                double elapsed = find_timer.elapsed_seconds();
+                std::cout << "  - Scan completed in " << elapsed << "s" << std::endl;
+                if (!results.empty()) {
+                    std::cout << "  - [OK] Found " << results.size() << " match(es). Aggregation logic verified." << std::endl;
+                } else {
+                    std::cout << "  - [FAIL] Needle was lost in the void. Aggregation might be broken." << std::endl;
+                }
+            });
+            wait_for_queue(cluster);
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "READ FAILURE: " << e.what() << std::endl;

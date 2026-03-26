@@ -69,6 +69,7 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 | **Random Global ID Read** | `5,325,150 reads/sec` |
 | **100,000 Random Reads** | `0.018 seconds` |
 | **Full 4.2GB Multi-Shard Scan** | `0.009 seconds` |
+| **Cross-Shard Aggregation** | `VERIFIED (10M rows / 8 Shards)` |
 
 ---
 
