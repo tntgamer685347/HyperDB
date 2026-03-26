@@ -35,7 +35,7 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 ---
 
 ## 🚀 Performance Benchmarks
-*(Tested on an AMD Ryzen 5800X doing its best not to catch fire)*
+*(Tested on an AMD Ryzen 7 5800X doing its best not to catch fire)*
 
 | Operation | Latency |
 | :--- | :--- |
