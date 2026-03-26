@@ -179,6 +179,43 @@ Don't mess with the `shard_limit` unless you've actually slept recently. After 1
 
 ---
 
+## 🏗️ Scaling Reality Check (Workstation vs. Datacenter)
+Listen carefully. This database is the **Workstation King**. If you're on a normal PC (anything from a 2GHz potato to a 5GHz gaming rig), HyperDB will absolutely **smoke** `SQLite3`, `MariaDB`, and `MySQL` in raw latency and throughput. It was born in the trenches of consumer hardware.
+
+**Where it wins:**
+*   **Hobbyist Projects**: Zero setup, just a header and a dream.
+*   **Workstations / Old PCs**: It's incredibly light and thrives on 2GHz to 5GHz clock speeds.
+*   **Single-User / Embedded**: When you need local data to move at the speed of your RAM.
+
+**Where it fails (The "Despair" starts here):**
+*   **128-Core Servers**: If you have 256GB of RAM and 12TB of NVMe disk, **do not use this**. HyperDB is single-threaded (per shard). Your 128-core server will be watching 127 cores do absolutely nothing while 1 core struggles to push your multi-terabyte dataset. 
+*   **High Concurrency**: This is not a multi-user Postgres replacement. It's a high-speed local buffer.
+
+If you're building a website for a million users, go use a "real" server DB. If you're building a high-speed local app that needs to feel like it's from the future? **You're in the right place.**
+
+---
+
+## 🗄️ Dataset Speed Expectations (The "Cold Start" Tax)
+You’ve seen the benchmarks. Let’s talk about reality. 
+
+*   **Sweet Spot (10 - 500,000 Rows)**: HyperDB is an absolute god. It loads instantly, saves instantly, and scans are basically "free." This is the core target. 
+*   **The "Millionaire" Problem (1M - 10M Rows)**: Once you cross the million-row mark in a single table, the **Cold Start Tax** kicks in. Your app will still crunch that data in milliseconds, but **loading and saving** will take 15 - 100 seconds because it has to derive AES keys from your PBKDF2 salt and physically encrypt gigabytes of state file. 
+
+**Summary:** If your app can afford a 20-second "Loading Profile..." screen at boot, go crazy. If not, try to keep your shards lean and your row counts under a million per cluster. 
+
+---
+
+## ⚡ Speed Hack (Security vs. Sanity)
+If you’re reading this and thinking, "85s? I don't have time for this," listen up.
+
+The **Cold Start Tax** is mostly the cost of **PBKDF2 Iterations (58,253 by default)**. 
+*   **Security Mode**: 58k+ iterations. Brute-force resistant. Your data is a fortress, but you’ll be waiting in line to get in. 
+*   **Speed Mode**: Set `iterations` to **1**. If you don't care about someone trying to guess your password, dropping this to 1 will make your 10M row database load in mere seconds. 
+
+At 1 iteration, the only "tax" remaining is the SHA256 hashing and the physical CPU cost of AES-256 decryption. **Choose your destiny wisely.**
+
+---
+
 ## ⚠️ Notes for the Brave
 
 1. **`HyperValue` Types**: This `std::variant` mirrors `HyperDB::ColumnType` exactly. If you add a type there and forget to update the `switch` statements in `HyperDB.cpp`, you will suffer. I guarantee it.

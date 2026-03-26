@@ -178,10 +178,10 @@ public:
     void OpenDB(const std::string& path, const std::string& password);
 
     // flush dirty mirror to disk. no-op if not dirty or interval hasn't elapsed.
-    void FlushDB(uint32_t iterations = 300000);
+    void FlushDB(uint32_t iterations = 58253);
 
     void SetFlushInterval(int64_t ms);
-    void ForceFlush(uint32_t iterations = 300000);
+    void ForceFlush(uint32_t iterations = 58253);
 
     // async queue operations — fire and forget (except Read/Find which use callbacks)
     void QueueCreateDatabase(const std::string& name);
@@ -257,9 +257,9 @@ public:
         const std::string& password,
         size_t shard_limit_bytes = DEFAULT_SHARD_LIMIT);
 
-    void Flush(uint32_t iterations = 300000);
+    void Flush(uint32_t iterations = 58253);
     void SetFlushInterval(int64_t ms);
-    void ForceFlush(uint32_t iterations = 300000);
+    void ForceFlush(uint32_t iterations = 58253);
     bool IsQueueEmpty();
 
     // schema ops — replicated across all shards automatically
