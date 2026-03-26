@@ -40,7 +40,7 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 | Operation | Latency |
 | :--- | :--- |
 | **New DB Initialization** | `0.07 ms` |
-| **Unlock existing AES DB** (58k PBKDF2 iterations) | `43.14 ms` |
+| **Unlock existing AES DB** (58k PBKDF2 iterations) | `42.87 ms` |
 | **Queue Write (2 Rows)** | `0.04 ms` |
 | **Queue Read (Async Callback)** | `0.04 ms` |
 | **Queue Find (Search Logic)** | `0.03 ms` |
@@ -54,9 +54,9 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 | Metric | Result |
 | :--- | :--- |
 | **Total Rows Written** | `10,000,000` |
-| **Throughput** | `88,069 rows/sec` |
+| **Throughput** | `92,842 rows/sec` |
 | **Total Data Size** | `4.2 GB` |
-| **Total Benchmark Time** | `115.3 seconds` |
+| **Total Write Loop Time** | `107.7 seconds` |
 | **Final Shard Count** | `8 Shards` |
 
 ---
@@ -66,9 +66,9 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 
 | Operation | Latency / Throughput |
 | :--- | :--- |
-| **Random Global ID Read** | `5,325,150 reads/sec` |
-| **100,000 Random Reads** | `0.018 seconds` |
-| **Full 4.2GB Multi-Shard Scan** | `0.009 seconds` |
+| **Random Global ID Read** | `5,212,430 reads/sec` |
+| **100,000 Random Reads** | `19.18 ms` |
+| **Full 4.2GB Multi-Shard Scan** | `8.50 ms` |
 | **Cross-Shard Aggregation** | `VERIFIED (10M rows / 8 Shards)` |
 
 ---
