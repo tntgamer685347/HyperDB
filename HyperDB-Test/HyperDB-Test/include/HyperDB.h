@@ -250,7 +250,7 @@ struct ShardTableEntry {
 
 class HyperDBCluster {
 public:
-    static constexpr size_t DEFAULT_SHARD_LIMIT = 1536ULL * 1024 * 1024; // 1.5 GB per shard (HyperDB's db single file limit is ~2Gb because flatbuffer is 32bit.)
+    static constexpr size_t DEFAULT_SHARD_LIMIT = 512ULL * 1024 * 1024; // 1.5 GB = 1536. - we only need 512 GB per shard for best performance. (HyperDB's db single file limit is ~2Gb because flatbuffer is 32bit.)
 
     // open or create a cluster in folder/. creates folder if needed.
     void Open(const std::string& folder, const std::string& name,
