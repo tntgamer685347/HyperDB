@@ -237,6 +237,7 @@ private:
     std::mutex           data_mutex_;
     std::mutex           flush_mutex_;
     bool                 dirty_ = false;
+    size_t               estimated_size_ = 0;
     int64_t              flush_interval_ms_ = 0;
     std::chrono::steady_clock::time_point last_flush_time_ = std::chrono::steady_clock::now();
 };
@@ -269,6 +270,7 @@ public:
 
     // data ops
     void QueueWrite(const std::string& table_name, std::vector<RowData> row);
+    void QueueWriteBulk(const std::string& table_name, std::vector<std::vector<RowData>> rows);
     void QueueRead(const std::string& table_name, uint64_t global_row_id, std::function<void(ReadResult)> callback);
     void QueueFind(const std::string& table_name, const std::string& column_name, HyperValue value, std::function<void(std::vector<ReadResult>)> callback, ShardTarget target = ShardTarget::All);
     void QueueDelete(const std::string& table_name, const std::string& column_name, HyperValue value, ShardTarget target = ShardTarget::All);

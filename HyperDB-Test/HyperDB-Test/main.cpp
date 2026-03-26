@@ -1,4 +1,84 @@
-#define CLUSTER_PERF_TEST
+//#define CLUSTER_PERF_TEST
+#define CLUSTER_READ_TEST
+
+#ifdef CLUSTER_READ_TEST
+#include "include/HyperDB.h"
+#include <iostream>
+#include <iomanip>
+#include <chrono>
+#include <random>
+#include <atomic>
+
+struct Timer {
+    std::chrono::high_resolution_clock::time_point start;
+    Timer() : start(std::chrono::high_resolution_clock::now()) {}
+    double elapsed_seconds() {
+        auto end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double>(end - start).count();
+    }
+};
+
+void wait_for_queue(HyperDBCluster& cluster) {
+    while (!cluster.IsQueueEmpty()) {
+        std::this_thread::yield();
+    }
+}
+
+int main() {
+    HyperDBCluster cluster;
+    const std::string PWD = "death";
+    const std::string FOLDER = "death_benchmark";
+
+    std::cout << "--- INITIATING READ APOCALYPSE ---" << std::endl;
+
+    try {
+        Timer load_timer;
+        cluster.Open(FOLDER, "death", PWD);
+        std::cout << "> Shards Loaded: " << cluster.GetShardCount() << " in " << load_timer.elapsed_seconds() << "s" << std::endl;
+
+        int total_rows = cluster.GetRowCount("death");
+        std::cout << "> Total Rows in Dataset: " << total_rows << std::endl;
+
+        // 1. Stress Test Global ID Resolution (100,000 random reads)
+        const int READ_COUNT = 100000;
+        std::atomic<int> completed_reads{ 0 };
+        std::mt19937 rng(1337);
+        std::uniform_int_distribution<int> dist(0, total_rows - 1);
+
+        std::cout << "> Stress testing 100,000 random global ID reads..." << std::endl;
+        Timer read_timer;
+        for (int i = 0; i < READ_COUNT; ++i) {
+            cluster.QueueRead("death", dist(rng), [&](ReadResult res) {
+                completed_reads++;
+            });
+            
+            // throttle a bit so we don't just allocate 100k callbacks instantly and die
+            if (i % 5000 == 0) wait_for_queue(cluster);
+        }
+        wait_for_queue(cluster);
+        double read_time = read_timer.elapsed_seconds();
+
+        std::cout << "  - 100k Reads took: " << read_time << "s (" << (READ_COUNT / read_time) << " reads/sec)" << std::endl;
+
+        // 2. Multi-Shard Aggregate Find (Aggregating across 8 physical files)
+        // We look for a string that likely won't exist just to force a full scan of all shards
+        std::cout << "> Multi-shard scan for non-existent value (full aggregation)..." << std::endl;
+        Timer find_timer;
+        cluster.QueueFind("death", "noise1", std::string("missing_no_9999"), [](std::vector<ReadResult> results) {
+            std::cout << "  - Scan completed. Found " << results.size() << " results." << std::endl;
+        });
+        wait_for_queue(cluster);
+        std::cout << "  - Full shard-aggregated scan took: " << find_timer.elapsed_seconds() << "s" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "READ FAILURE: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
+#endif
+
 #ifdef CLUSTER_PERF_TEST
 #include "include/HyperDB.h"
 #include <iostream>
@@ -73,24 +153,28 @@ int main() {
 
         Timer loop_timer;
         Timer lap_timer;
-        for (int i = 1; i <= TOTAL_ROWS; ++i) {
-            cluster.QueueWrite("death", {
-                {"noise1", fast_noise(128, rng)},
-                {"noise2", fast_noise(128, rng)},
-                {"noise3", fast_noise(128, rng)}
-                });
+        const int BATCH_SIZE = 10000;
+        for (int i = 0; i < TOTAL_ROWS; i += BATCH_SIZE) {
+            std::vector<std::vector<RowData>> batch;
+            batch.reserve(BATCH_SIZE);
+            for (int j = 0; j < BATCH_SIZE; ++j) {
+                batch.push_back({
+                    {"noise1", fast_noise(128, rng)},
+                    {"noise2", fast_noise(128, rng)},
+                    {"noise3", fast_noise(128, rng)}
+                    });
+            }
+            cluster.QueueWriteBulk("death", std::move(batch));
 
             // check memory sanity every 1M rows
-            if (i % 1000000 == 0) {
-                double pct = (static_cast<double>(i) / TOTAL_ROWS) * 100.0;
+            int current_rows = i + BATCH_SIZE;
+            if (current_rows % 1000000 == 0) {
+                double pct = (static_cast<double>(current_rows) / TOTAL_ROWS) * 100.0;
                 double lap_time = lap_timer.elapsed_seconds();
-                std::cout << "  > progress: " << (int)pct << "% (" << i << " rows queued). Last 1M took: " << lap_time << "s" << std::endl;
+                std::cout << "  > progress: " << (int)pct << "% (" << current_rows << " rows queued). Last 1M took: " << lap_time << "s" << std::endl;
                 lap_timer = Timer(); // restart lap timer for next mill
 
-
                 // wait for background thread to catch up so we don't hit 32GB ram limit
-                // if we don't do this, the std::queue will swallow your entire OS.
-                // idc - dev.
                 wait_for_queue(cluster);
             }
         }
@@ -123,6 +207,7 @@ int main() {
     return 0;
 }
 #else
+#ifndef CLUSTER_READ_TEST
 #include "include/HyperDB.h"
 #include <iostream>
 #include <iomanip>
@@ -305,4 +390,5 @@ int main() {
 
     return 0;
 }
+#endif
 #endif

@@ -348,24 +348,59 @@ void HyperDBManager::ExecCreateTable(const std::string& table_name, const std::v
     }
     mirror_.tables.push_back(std::move(table));
     dirty_ = true;
+    estimated_size_ += table_name.length();
+    for (const auto& c : cols) estimated_size_ += c.name.length() + 8; // rough overhead per column
 }
 
 void HyperDBManager::ExecDropTable(const std::string& table_name) {
     std::lock_guard<std::mutex> lock(data_mutex_);
     auto& tables = mirror_.tables;
-    tables.erase(
-        std::remove_if(tables.begin(), tables.end(),
-            [&](const TableMirror& t) { return t.name == table_name; }),
-        tables.end()
-    );
-    dirty_ = true;
+    auto it = std::remove_if(tables.begin(), tables.end(),
+            [&](const TableMirror& t) { return t.name == table_name; });
+    if (it != tables.end()) {
+        // Recalculate size reduction
+        estimated_size_ -= table_name.length();
+        for (const auto& col : it->columns) {
+            estimated_size_ -= col.name.length() + 8; // overhead
+            estimated_size_ -= col.i8.size() * sizeof(int8_t);
+            estimated_size_ -= col.i16.size() * sizeof(int16_t);
+            estimated_size_ -= col.i32.size() * sizeof(int32_t);
+            estimated_size_ -= col.i64.size() * sizeof(int64_t);
+            estimated_size_ -= col.u8.size() * sizeof(uint8_t);
+            estimated_size_ -= col.u16.size() * sizeof(uint16_t);
+            estimated_size_ -= col.u32.size() * sizeof(uint32_t);
+            estimated_size_ -= col.u64.size() * sizeof(uint64_t);
+            estimated_size_ -= col.f32.size() * sizeof(float);
+            estimated_size_ -= col.f64.size() * sizeof(double);
+            estimated_size_ -= col.bools.size() * sizeof(uint8_t);
+            for (const auto& s : col.strings) estimated_size_ -= s.size();
+        }
+        tables.erase(it, tables.end());
+        dirty_ = true;
+    }
 }
 
 void HyperDBManager::ExecClearTable(const std::string& table_name) {
     std::lock_guard<std::mutex> lock(data_mutex_);
     TableMirror* table = FindTable(table_name);
     if (!table) return;
-    for (auto& col : table->columns) col = ColumnMirror{ col.name, col.type };
+
+    // Subtract old data size
+    for (auto& col : table->columns) {
+        estimated_size_ -= col.i8.size() * sizeof(int8_t);
+        estimated_size_ -= col.i16.size() * sizeof(int16_t);
+        estimated_size_ -= col.i32.size() * sizeof(int32_t);
+        estimated_size_ -= col.i64.size() * sizeof(int64_t);
+        estimated_size_ -= col.u8.size() * sizeof(uint8_t);
+        estimated_size_ -= col.u16.size() * sizeof(uint16_t);
+        estimated_size_ -= col.u32.size() * sizeof(uint32_t);
+        estimated_size_ -= col.u64.size() * sizeof(uint64_t);
+        estimated_size_ -= col.f32.size() * sizeof(float);
+        estimated_size_ -= col.f64.size() * sizeof(double);
+        estimated_size_ -= col.bools.size() * sizeof(uint8_t);
+        for (const auto& s : col.strings) estimated_size_ -= s.size();
+        col = ColumnMirror{ col.name, col.type }; // Clear data
+    }
     table->row_count = 0;
     dirty_ = true;
 }
@@ -376,6 +411,20 @@ void HyperDBManager::ExecClearColumn(const std::string& table_name, const std::s
     if (!table) return;
     ColumnMirror* col   = FindColumn(*table, column_name);
     if (!col)  return;
+
+    // Subtract old data size
+    estimated_size_ -= col->i8.size() * sizeof(int8_t);
+    estimated_size_ -= col->i16.size() * sizeof(int16_t);
+    estimated_size_ -= col->i32.size() * sizeof(int32_t);
+    estimated_size_ -= col->i64.size() * sizeof(int64_t);
+    estimated_size_ -= col->u8.size() * sizeof(uint8_t);
+    estimated_size_ -= col->u16.size() * sizeof(uint16_t);
+    estimated_size_ -= col->u32.size() * sizeof(uint32_t);
+    estimated_size_ -= col->u64.size() * sizeof(uint64_t);
+    estimated_size_ -= col->f32.size() * sizeof(float);
+    estimated_size_ -= col->f64.size() * sizeof(double);
+    estimated_size_ -= col->bools.size() * sizeof(uint8_t);
+    for (const auto& s : col->strings) estimated_size_ -= s.size();
 
     // clear all the things. yes all of them. no, you can't just clear one.
     col->i8.clear();  col->i16.clear();   col->i32.clear();    col->i64.clear();
@@ -396,18 +445,23 @@ void HyperDBManager::ExecWrite(const std::string& table_name, const std::vector<
         ColumnMirror* col = &table->columns[it->second];
 
         switch (col->type) {
-        case HyperDB::ColumnType::ColumnType_Int8:    col->i8.push_back(static_cast<int8_t>(CoerceI64(rd.value)));    break;
-        case HyperDB::ColumnType::ColumnType_Int16:   col->i16.push_back(static_cast<int16_t>(CoerceI64(rd.value)));  break;
-        case HyperDB::ColumnType::ColumnType_Int32:   col->i32.push_back(static_cast<int32_t>(CoerceI64(rd.value)));  break;
-        case HyperDB::ColumnType::ColumnType_Int64:   col->i64.push_back(CoerceI64(rd.value));                         break;
-        case HyperDB::ColumnType::ColumnType_UInt8:   col->u8.push_back(static_cast<uint8_t>(CoerceU64(rd.value)));   break;
-        case HyperDB::ColumnType::ColumnType_UInt16:  col->u16.push_back(static_cast<uint16_t>(CoerceU64(rd.value))); break;
-        case HyperDB::ColumnType::ColumnType_UInt32:  col->u32.push_back(static_cast<uint32_t>(CoerceU64(rd.value))); break;
-        case HyperDB::ColumnType::ColumnType_UInt64:  col->u64.push_back(CoerceU64(rd.value));                         break;
-        case HyperDB::ColumnType::ColumnType_Float32: col->f32.push_back(static_cast<float>(CoerceF64(rd.value)));    break;
-        case HyperDB::ColumnType::ColumnType_Float64: col->f64.push_back(CoerceF64(rd.value));                         break;
-        case HyperDB::ColumnType::ColumnType_Bool:    col->bools.push_back(CoerceI64(rd.value) ? 1u : 0u);             break;
-        case HyperDB::ColumnType::ColumnType_String:  col->strings.push_back(HyperDBUtil::HyperValueToString(rd.value)); break;
+        case HyperDB::ColumnType::ColumnType_Int8:    col->i8.push_back(static_cast<int8_t>(CoerceI64(rd.value)));    estimated_size_ += sizeof(int8_t); break;
+        case HyperDB::ColumnType::ColumnType_Int16:   col->i16.push_back(static_cast<int16_t>(CoerceI64(rd.value)));  estimated_size_ += sizeof(int16_t); break;
+        case HyperDB::ColumnType::ColumnType_Int32:   col->i32.push_back(static_cast<int32_t>(CoerceI64(rd.value)));  estimated_size_ += sizeof(int32_t); break;
+        case HyperDB::ColumnType::ColumnType_Int64:   col->i64.push_back(CoerceI64(rd.value));                         estimated_size_ += sizeof(int64_t); break;
+        case HyperDB::ColumnType::ColumnType_UInt8:   col->u8.push_back(static_cast<uint8_t>(CoerceU64(rd.value)));   estimated_size_ += sizeof(uint8_t); break;
+        case HyperDB::ColumnType::ColumnType_UInt16:  col->u16.push_back(static_cast<uint16_t>(CoerceU64(rd.value))); estimated_size_ += sizeof(uint16_t); break;
+        case HyperDB::ColumnType::ColumnType_UInt32:  col->u32.push_back(static_cast<uint32_t>(CoerceU64(rd.value))); estimated_size_ += sizeof(uint32_t); break;
+        case HyperDB::ColumnType::ColumnType_UInt64:  col->u64.push_back(CoerceU64(rd.value));                         estimated_size_ += sizeof(uint64_t); break;
+        case HyperDB::ColumnType::ColumnType_Float32: col->f32.push_back(static_cast<float>(CoerceF64(rd.value)));    estimated_size_ += sizeof(float); break;
+        case HyperDB::ColumnType::ColumnType_Float64: col->f64.push_back(CoerceF64(rd.value));                         estimated_size_ += sizeof(double); break;
+        case HyperDB::ColumnType::ColumnType_Bool:    col->bools.push_back(CoerceI64(rd.value) ? 1u : 0u);             estimated_size_ += sizeof(uint8_t); break;
+        case HyperDB::ColumnType::ColumnType_String:  {
+            std::string s = HyperDBUtil::HyperValueToString(rd.value);
+            estimated_size_ += s.length();
+            col->strings.push_back(std::move(s));
+            break;
+        }
         default: break;
         }
     }
@@ -595,18 +649,18 @@ void HyperDBManager::ExecDelete(const std::string& table_name, const std::string
         for (auto it = to_delete.rbegin(); it != to_delete.rend(); ++it) {
             size_t idx = *it;
             switch (c.type) {
-            case HyperDB::ColumnType::ColumnType_Int8:    c.i8.erase(c.i8.begin()         + idx); break;
-            case HyperDB::ColumnType::ColumnType_Int16:   c.i16.erase(c.i16.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_Int32:   c.i32.erase(c.i32.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_Int64:   c.i64.erase(c.i64.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_UInt8:   c.u8.erase(c.u8.begin()         + idx); break;
-            case HyperDB::ColumnType::ColumnType_UInt16:  c.u16.erase(c.u16.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_UInt32:  c.u32.erase(c.u32.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_UInt64:  c.u64.erase(c.u64.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_Float32: c.f32.erase(c.f32.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_Float64: c.f64.erase(c.f64.begin()       + idx); break;
-            case HyperDB::ColumnType::ColumnType_Bool:    c.bools.erase(c.bools.begin()   + idx); break;
-            case HyperDB::ColumnType::ColumnType_String:  c.strings.erase(c.strings.begin() + idx); break;
+            case HyperDB::ColumnType::ColumnType_Int8:    estimated_size_ -= sizeof(int8_t); c.i8.erase(c.i8.begin()         + idx); break;
+            case HyperDB::ColumnType::ColumnType_Int16:   estimated_size_ -= sizeof(int16_t); c.i16.erase(c.i16.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_Int32:   estimated_size_ -= sizeof(int32_t); c.i32.erase(c.i32.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_Int64:   estimated_size_ -= sizeof(int64_t); c.i64.erase(c.i64.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_UInt8:   estimated_size_ -= sizeof(uint8_t); c.u8.erase(c.u8.begin()         + idx); break;
+            case HyperDB::ColumnType::ColumnType_UInt16:  estimated_size_ -= sizeof(uint16_t); c.u16.erase(c.u16.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_UInt32:  estimated_size_ -= sizeof(uint32_t); c.u32.erase(c.u32.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_UInt64:  estimated_size_ -= sizeof(uint64_t); c.u64.erase(c.u64.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_Float32: estimated_size_ -= sizeof(float); c.f32.erase(c.f32.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_Float64: estimated_size_ -= sizeof(double); c.f64.erase(c.f64.begin()       + idx); break;
+            case HyperDB::ColumnType::ColumnType_Bool:    estimated_size_ -= sizeof(uint8_t); c.bools.erase(c.bools.begin()   + idx); break;
+            case HyperDB::ColumnType::ColumnType_String:  estimated_size_ -= c.strings[idx].length(); c.strings.erase(c.strings.begin() + idx); break;
             default: break;
             }
         }
@@ -706,34 +760,41 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database* db) {
     mirror_ = {};
     mirror_.name    = db->name()->str();
     mirror_.version = db->version();
+    estimated_size_ = mirror_.name.length(); // Initialize with DB name size
     if (!db->tables()) return;
 
     for (auto* tbl : *db->tables()) {
         TableMirror tm;
         tm.name      = tbl->name()->str();
         tm.row_count = tbl->row_count();
+        estimated_size_ += tm.name.length(); // Add table name size
 
         if (tbl->columns()) {
             for (auto* col : *tbl->columns()) {
                 ColumnMirror cm;
                 cm.name = col->name()->str();
                 cm.type = col->type();
+                estimated_size_ += cm.name.length() + 8; // Add column name size + overhead
 
                 switch (col->type()) {
-                case HyperDB::ColumnType::ColumnType_Int8:    if (auto* c = col->data_as_Int8Column())    cm.i8.assign(c->values()->begin(), c->values()->end());     break;
-                case HyperDB::ColumnType::ColumnType_Int16:   if (auto* c = col->data_as_Int16Column())   cm.i16.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_Int32:   if (auto* c = col->data_as_Int32Column())   cm.i32.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_Int64:   if (auto* c = col->data_as_Int64Column())   cm.i64.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_UInt8:   if (auto* c = col->data_as_UInt8Column())   cm.u8.assign(c->values()->begin(), c->values()->end());     break;
-                case HyperDB::ColumnType::ColumnType_UInt16:  if (auto* c = col->data_as_UInt16Column())  cm.u16.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_UInt32:  if (auto* c = col->data_as_UInt32Column())  cm.u32.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_UInt64:  if (auto* c = col->data_as_UInt64Column())  cm.u64.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_Float32: if (auto* c = col->data_as_Float32Column()) cm.f32.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_Float64: if (auto* c = col->data_as_Float64Column()) cm.f64.assign(c->values()->begin(), c->values()->end());    break;
-                case HyperDB::ColumnType::ColumnType_Bool:    if (auto* c = col->data_as_BoolColumn())    cm.bools.assign(c->values()->begin(), c->values()->end());  break;
+                case HyperDB::ColumnType::ColumnType_Int8:    if (auto* c = col->data_as_Int8Column())    { cm.i8.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.i8.size() * sizeof(int8_t); } break;
+                case HyperDB::ColumnType::ColumnType_Int16:   if (auto* c = col->data_as_Int16Column())   { cm.i16.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.i16.size() * sizeof(int16_t); } break;
+                case HyperDB::ColumnType::ColumnType_Int32:   if (auto* c = col->data_as_Int32Column())   { cm.i32.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.i32.size() * sizeof(int32_t); } break;
+                case HyperDB::ColumnType::ColumnType_Int64:   if (auto* c = col->data_as_Int64Column())   { cm.i64.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.i64.size() * sizeof(int64_t); } break;
+                case HyperDB::ColumnType::ColumnType_UInt8:   if (auto* c = col->data_as_UInt8Column())   { cm.u8.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.u8.size() * sizeof(uint8_t); } break;
+                case HyperDB::ColumnType::ColumnType_UInt16:  if (auto* c = col->data_as_UInt16Column())  { cm.u16.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.u16.size() * sizeof(uint16_t); } break;
+                case HyperDB::ColumnType::ColumnType_UInt32:  if (auto* c = col->data_as_UInt32Column())  { cm.u32.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.u32.size() * sizeof(uint32_t); } break;
+                case HyperDB::ColumnType::ColumnType_UInt64:  if (auto* c = col->data_as_UInt64Column())  { cm.u64.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.u64.size() * sizeof(uint64_t); } break;
+                case HyperDB::ColumnType::ColumnType_Float32: if (auto* c = col->data_as_Float32Column()) { cm.f32.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.f32.size() * sizeof(float); } break;
+                case HyperDB::ColumnType::ColumnType_Float64: if (auto* c = col->data_as_Float64Column()) { cm.f64.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.f64.size() * sizeof(double); } break;
+                case HyperDB::ColumnType::ColumnType_Bool:    if (auto* c = col->data_as_BoolColumn())    { cm.bools.assign(c->values()->begin(), c->values()->end()); estimated_size_ += cm.bools.size() * sizeof(uint8_t); } break;
                 case HyperDB::ColumnType::ColumnType_String:
-                    if (auto* c = col->data_as_StringColumn())
-                        for (auto* s : *c->values()) cm.strings.push_back(s->str());
+                    if (auto* c = col->data_as_StringColumn()) {
+                        for (auto* s : *c->values()) {
+                            cm.strings.push_back(s->str());
+                            estimated_size_ += s->str().length();
+                        }
+                    }
                     break;
                 default: break;
                 }
@@ -746,6 +807,18 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database* db) {
         }
         mirror_.tables.push_back(std::move(tm));
     }
+    estimated_size_ = EstimateMirrorSize(); // wait, we have to recurse one last time. 
+    // actually, let's just do it right here since this is deser.
+    size_t s = 0;
+    for (auto& t : mirror_.tables) {
+        s += t.name.size();
+        for (auto& c : t.columns) {
+            s += c.name.size();
+            s += c.i8.size() + c.i16.size()*2 + c.i32.size()*4 + c.i64.size()*8 + c.u8.size() + c.u16.size()*2 + c.u32.size()*4 + c.u64.size()*8 + c.f32.size()*4 + c.f64.size()*8 + c.bools.size();
+            for (auto& str : c.strings) s += str.size();
+        }
+    }
+    estimated_size_ = s;
 }
 
 // ═════════════════════════════════════════
@@ -838,6 +911,24 @@ void HyperDBCluster::QueueWrite(const std::string& table_name, std::vector<RowDa
         entries.back().row_end = global_row_id;
     else
         entries.push_back({ active_shard_index_, global_row_id, global_row_id });
+}
+
+void HyperDBCluster::QueueWriteBulk(const std::string& table_name, std::vector<std::vector<RowData>> rows) {
+    if (rows.empty()) return;
+    MaybeSpillToNewShard();
+    
+    // check if the batch is MASSIVE. if so, we split it. 
+    // idc - dev. just push it to the active shard.
+    uint64_t global_start = NextGlobalRowId(table_name);
+    uint64_t global_end   = global_start + rows.size() - 1;
+    
+    ActiveShard().QueueWriteBulk(table_name, std::move(rows));
+
+    auto& entries = manifest_tables_[table_name];
+    if (!entries.empty() && entries.back().shard_index == active_shard_index_)
+        entries.back().row_end = global_end;
+    else
+        entries.push_back({ active_shard_index_, global_start, global_end });
 }
 
 void HyperDBCluster::QueueRead(const std::string& table_name, uint64_t global_row_id, std::function<void(ReadResult)> callback) {

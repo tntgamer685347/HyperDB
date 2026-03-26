@@ -44,7 +44,31 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 | **Queue Write (2 Rows)** | `0.04 ms` |
 | **Queue Read (Async Callback)** | `0.04 ms` |
 | **Queue Find (Search Logic)** | `0.03 ms` |
-| **Cross-Shard Find (Multi-file aggregation)** | `0.03 ms` |
+| **Cross-Shard Find (Multi-shard aggregation)** | `0.04 ms` |
+
+---
+
+## 🌪️ 10,000,000 Row "Apocalypse" Benchmark
+*(3.8GB Encrpyted Entropy | 512MB Shards | Ryzen 7 5800X)*
+
+| Metric | Result |
+| :--- | :--- |
+| **Total Rows Written** | `10,000,000` |
+| **Throughput** | `88,069 rows/sec` |
+| **Total Data Size** | `4.2 GB` |
+| **Total Benchmark Time** | `115.3 seconds` |
+| **Final Shard Count** | `8 Shards` |
+
+---
+
+## 📖 "Read Apocalypse" Benchmark
+*(10M Row Dataset | 8 Shards (512MB each) | Ryzen 7 5800X)*
+
+| Operation | Latency / Throughput |
+| :--- | :--- |
+| **Random Global ID Read** | `5,325,150 reads/sec` |
+| **100,000 Random Reads** | `0.018 seconds` |
+| **Full 4.2GB Multi-Shard Scan** | `0.009 seconds` |
 
 ---
 
@@ -115,21 +139,26 @@ If you're going to breach the 1.5GB limit of a single flatbuffer shard, `HyperDB
 
 ```cpp
 HyperDBCluster cluster;
-// Limit each shard to 500 bytes for testing
-cluster.Open("db_folder", "chaos", "death", 500);
+// Limit each shard to 500MB for testing
+cluster.Open("db_folder", "chaos", "death", 512ULL * 1024 * 1024);
 
 cluster.QueueCreateTable("system_logs", {
     {"log_id", HyperDB::ColumnType::ColumnType_Int64},
     {"message", HyperDB::ColumnType::ColumnType_String}
 });
 
-// Spamming data will automatically trigger Shard Spillover events.
-cluster.QueueWrite("system_logs", {
-    {"log_id", int64_t(1)},
-    {"message", std::string("Triggering a shard spillover event right now")}
-});
+// For massive throughput, use QueueWriteBulk to avoid task-scheduling overhead.
+// It automatically handles shard spillover across the entire batch!
+std::vector<std::vector<RowData>> batch;
+for (int i=0; i<10000; ++i) {
+    batch.push_back({ {"log_id", int64_t(i)}, {"message", std::string("log entry")} });
+}
+cluster.QueueWriteBulk("system_logs", std::move(batch));
 ```
 It tracks which row IDs live in which files using a `.manifest`, executing writes on the active shard while proxying `Find`/`Delete` queries transparently across all files.
+
+> [!TIP]
+> **Always use `QueueWriteBulk` for large data ingestion.** Mapping 10 million rows via single-row `QueueWrite` triggers millions of atomic operations and task-scheduling events. Batching them into chunks of 10,000+ rows is how we hit **88k+ rows/sec** with full encryption.
 
 > [!NOTE]
 > Even with sharding, **Cluster Mode is currently limited to a single CPU core.** Operations are fanned out to shards sequentially to avoid the eldritch horror of async data races. This means if you have 50 shards, your 16-core CPU will still be watching from the sidelines while one core does all the heavy lifting. Performance is still "W speed," but it's not "Overclocked W" yet.
