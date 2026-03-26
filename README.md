@@ -131,6 +131,9 @@ cluster.QueueWrite("system_logs", {
 ```
 It tracks which row IDs live in which files using a `.manifest`, executing writes on the active shard while proxying `Find`/`Delete` queries transparently across all files.
 
+> [!NOTE]
+> Even with sharding, **Cluster Mode is currently limited to a single CPU core.** Operations are fanned out to shards sequentially to avoid the eldritch horror of async data races. This means if you have 50 shards, your 16-core CPU will still be watching from the sidelines while one core does all the heavy lifting. Performance is still "W speed," but it's not "Overclocked W" yet.
+
 ---
 
 ## ⚠️ Notes for the Brave
