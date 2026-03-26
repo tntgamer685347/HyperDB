@@ -255,6 +255,13 @@ void HyperDBManager::ForceFlush(uint32_t iterations) {
     FlushDB(iterations);
 }
 
+void HyperDBManager::SetEncryption(bool encrypt, const std::string& password) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    should_encrypt_ = encrypt;
+    password_       = password;
+    dirty_          = true; // force a flush next time
+}
+
 // ═════════════════════════════════════════
 // HyperDBManager — queue dispatch
 // ═════════════════════════════════════════
@@ -865,6 +872,16 @@ void HyperDBCluster::SetFlushInterval(int64_t ms) {
 
 void HyperDBCluster::ForceFlush(uint32_t iterations) {
     for (auto& shard : shards_) shard->ForceFlush(iterations);
+    SaveManifest();
+}
+
+void HyperDBCluster::SetEncryption(bool encrypt, const std::string& password) {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    password_       = password;
+    should_encrypt_ = encrypt;
+    for (auto& shard : shards_) {
+        shard->SetEncryption(encrypt, password);
+    }
     SaveManifest();
 }
 

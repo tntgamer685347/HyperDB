@@ -176,6 +176,7 @@ public:
 
     // open or create a db file. throws on wrong password/corrupt data if encrypt=true.
     void OpenDB(const std::string& path, const std::string& password = "", bool encrypt = true);
+    void SetEncryption(bool encrypt, const std::string& password = "");
 
     // flush dirty mirror to disk. no-op if not dirty or interval hasn't elapsed.
     void FlushDB(uint32_t iterations = 58253);
@@ -262,6 +263,7 @@ public:
     void Flush(uint32_t iterations = 58253);
     void SetFlushInterval(int64_t ms);
     void ForceFlush(uint32_t iterations = 58253);
+    void SetEncryption(bool encrypt, const std::string& password = "");
     bool IsQueueEmpty();
 
     // schema ops — replicated across all shards automatically

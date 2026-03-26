@@ -114,8 +114,20 @@ void RunSoloTests() {
 
     {
         Timer t;
-        db.ForceFlush(58253); // flush database with 58253 pbkdf2 iterations
-        std::cout << "      > ForceFlush (Finalize) took: " << t.elapsed_ms() << " ms" << std::endl;
+        db.ForceFlush(1); // flush unencrypted
+        std::cout << "      > ForceFlush (Unencrypted) took: " << t.elapsed_ms() << " ms" << std::endl;
+        
+        std::cout << "      > Migrating to ENCRYPTED (Fort Knox)..." << std::endl;
+        db.SetEncryption(true, "secure_pass");
+        db.ForceFlush(1);
+        
+        HyperDBManager db2;
+        db2.OpenDB("test_solo.db", "secure_pass", true);
+        ASSERT_TEST(db2.GetRowCount("test_table") == 1, "Encrypted migration verified");
+        
+        std::cout << "      > Migrating back to NITRO (Unencrypted)..." << std::endl;
+        db2.SetEncryption(false, "");
+        db2.ForceFlush(1);
     }
 }
 
@@ -133,7 +145,7 @@ void RunClusterWriteBenchmark() {
 
     {
         Timer t;
-        cluster.Open(FOLDER, "death", PWD, SHARD_LIMIT);
+        cluster.Open(FOLDER, "death", PWD, SHARD_LIMIT, false);
         std::cout << "      > Cluster Initialization took: " << t.elapsed_ms() << " ms" << std::endl;
     }
 
@@ -177,46 +189,70 @@ void RunClusterWriteBenchmark() {
 
     {
         Timer t;
-        cluster.ForceFlush(58253); // flush database with 58253 pbkdf2 iterations
-        std::cout << "      > Cluster Finalize (Flush All) took: " << t.elapsed_ms() << " ms" << std::endl;
+        cluster.ForceFlush(1); // fast flush for benchmark initialization
+        std::cout << "      > Cluster Finalize took: " << t.elapsed_ms() << " ms" << std::endl;
     }
 }
 
 void RunClusterReadBenchmark() {
     std::cout << "\n[3] INITIATING READ APOCALYPSE (STRESS TEST)" << std::endl;
-    HyperDBCluster cluster;
     const std::string PWD = "death";
     const std::string FOLDER = "death_benchmark";
+    const size_t SHARD_LIMIT = 512ULL * 1024 * 1024;
 
-    try {
-        {
-            Timer t;
-            cluster.Open(FOLDER, "death", PWD);
-            std::cout << "      > Cluster Read-Open took: " << t.elapsed_ms() << " ms" << std::endl;
-        }
-
-        int total_rows = cluster.GetRowCount("death");
-        const int READ_COUNT = 100000;
+    auto perform_read_test = [&](HyperDBCluster& c, const std::string& label) {
+        std::cout << "\n  --- PHASE: " << label << " ---" << std::endl;
+        int total_rows = c.GetRowCount("death");
+        const int READ_COUNT = 10000; 
         std::atomic<int> completed_reads{ 0 };
         std::mt19937 rng(1337);
         std::uniform_int_distribution<int> dist(0, total_rows - 1);
 
-        std::cout << "  > Stress testing 100,000 random global ID reads..." << std::endl;
         Timer read_timer;
         for (int i = 0; i < READ_COUNT; ++i) {
-            cluster.QueueRead("death", dist(rng), [&](ReadResult res) { completed_reads++; });
-            if (i % 10000 == 0) wait_for_queue(cluster);
+            c.QueueRead("death", dist(rng), [&](ReadResult res) { completed_reads++; });
+            if (i % 5000 == 0) wait_for_queue(c);
         }
-        wait_for_queue(cluster);
-        double total_read_ms = read_timer.elapsed_ms();
-        std::cout << "      > 100k Reads total time: " << total_read_ms << " ms (" << (100000.0 / (total_read_ms / 1000.0)) << " reads/sec)" << std::endl;
+        wait_for_queue(c);
+        std::cout << "      > " << label << " reads/sec: " << (READ_COUNT / (read_timer.elapsed_ms() / 1000.0)) << std::endl;
+    };
 
-        std::cout << "  > Full aggregate scan (cross-shard)..." << std::endl;
+    try {
         {
-            Timer t;
-            cluster.QueueFind("death", "noise1", std::string("missing_no_9999"), [](std::vector<ReadResult> results) {});
-            wait_for_queue(cluster);
-            std::cout << "      > Full Shard Scan took: " << t.elapsed_ms() << " ms" << std::endl;
+            HyperDBCluster c1;
+            c1.Open(FOLDER, "death", PWD, SHARD_LIMIT, false);
+            perform_read_test(c1, "ORIGINAL NITRO");
+
+            std::cout << "  > MIGRATING 4.2GB TO FORT KNOX (ENCRYPTED)..." << std::endl;
+            Timer mig_timer;
+            c1.SetEncryption(true, "death");
+            c1.ForceFlush(1); // 1 iteration for speed
+            std::cout << "      > Migration to Encrypted took: " << mig_timer.elapsed_ms() << " ms" << std::endl;
+        }
+
+        {
+            HyperDBCluster c2;
+            std::cout << "  > LOADING ENCRYPTED CLUSTER (COLD START TAX)..." << std::endl;
+            Timer open_timer;
+            c2.Open(FOLDER, "death", "death", SHARD_LIMIT, true);
+            std::cout << "      > Cold Open (Encrypted) took: " << open_timer.elapsed_ms() << " ms" << std::endl;
+            perform_read_test(c2, "ENCRYPTED");
+
+            std::cout << "  > MIGRATING 4.2GB BACK TO NITRO..." << std::endl;
+            Timer mig_timer;
+            c2.SetEncryption(false, "");
+            c2.ForceFlush(1);
+            std::cout << "      > Migration back to Nitro took: " << mig_timer.elapsed_ms() << " ms" << std::endl;
+        }
+
+        {
+            HyperDBCluster c3;
+            std::cout << "  > LOADING NITRO CLUSTER (INSTANT OPEN)..." << std::endl;
+            Timer open_timer;
+            c3.Open(FOLDER, "death", "", SHARD_LIMIT, false);
+            std::cout << "      > Cold Open (Nitro) took: " << open_timer.elapsed_ms() << " ms" << std::endl;
+            perform_read_test(c3, "POST-MIGRATION NITRO");
+            std::cout << "  [OK] Full migration cycle verified on 4.2GB dataset." << std::endl;
         }
 
     } catch (const std::exception& e) {

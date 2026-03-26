@@ -82,6 +82,19 @@ Once the data is in memory, encrypted and unencrypted are basically the same spe
 
 ---
 
+## 🏎️ Live Migration Performance
+*(4.2GB Dataset | Ryzen 7 5800X | Sharding Enabled)*
+
+| Migration Path | Time Taken | Result |
+| :--- | :--- | :--- |
+| **Nitro → Fort Knox** (1 iter) | `~83.2 seconds` | Full AES-256 re-serialization of all shards. |
+| **Fort Knox → Nitro** | `~10.0 seconds` | AES pipeline removed. Writing raw FlatBuffers to disk. |
+| **Instant Cold Open** (Nitro) | `~7.8 seconds` | Raw SSD read speed. Zero crypto overhead. |
+
+**Note:** Migrating a cluster is an IO-bound operation. All shards are flushed sequentially. If you have 8 shards, each one has to be re-encrypted and written before the cluster is considered "migrated." Plan your 3AM sessions accordingly.
+
+---
+
 ## 🏗️ Installation & Setup
 
 1. Include `HyperDB.h` in your project.
@@ -287,6 +300,7 @@ cluster.Open("folder", "db", "sandwich", 512ULL*1024*1024, false);
 | Method | Description |
 | :--- | :--- |
 | `OpenDB(path, password, encrypt=true)` | Open or create a database file. `encrypt=false` skips AES/PBKDF2 entirely — raw FlatBuffers, no cold start tax, no protection. Throws on wrong password or corrupt data in encrypted mode. |
+| `SetEncryption(encrypt, password)` | Live migration. Change password or toggle AES-256 on/off for an open database. Marks DB dirty for next flush. |
 | `FlushDB(iterations)` | Serialize mirror to disk. Encrypts if `encrypt=true`, writes raw if not. No-op if not dirty or interval hasn't elapsed. |
 | `ForceFlush(iterations)` | Override interval and flush immediately. `iterations` is ignored in Nitro Mode. |
 | `SetFlushInterval(ms)` | Minimum milliseconds between flushes. `0` = always flush. |
@@ -308,6 +322,7 @@ cluster.Open("folder", "db", "sandwich", 512ULL*1024*1024, false);
 | Method | Description |
 | :--- | :--- |
 | `Open(folder, name, password, shard_limit, encrypt=true)` | Open or create a sharded cluster. The `encrypt` flag is stored in the `.manifest` — all future shards inherit it. You cannot change modes on an existing cluster. Creates `folder/` if needed. |
+| `SetEncryption(encrypt, password)` | Live migration for the entire cluster. Upgrades/Downgrades every shard and updates the `.manifest`. |
 | `QueueWriteBulk(table, rows)` | Batch write. Handles shard spillover across the batch automatically. |
 | `QueueRead(table, global_row_id, cb)` | Resolves global row ID to the correct shard and local index via manifest. |
 | `QueueFind(table, col, value, cb, target)` | Fan-out find across shards matching `target`. Merges results when all return. |
