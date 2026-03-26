@@ -203,18 +203,27 @@ void RunClusterReadBenchmark() {
     auto perform_read_test = [&](HyperDBCluster& c, const std::string& label) {
         std::cout << "\n  --- PHASE: " << label << " ---" << std::endl;
         int total_rows = c.GetRowCount("death");
-        const int READ_COUNT = 10000; 
+        const int READ_COUNT = 100000; 
         std::atomic<int> completed_reads{ 0 };
         std::mt19937 rng(1337);
         std::uniform_int_distribution<int> dist(0, total_rows - 1);
 
+        std::cout << "      > Stress testing 100,000 random global ID reads..." << std::endl;
         Timer read_timer;
         for (int i = 0; i < READ_COUNT; ++i) {
             c.QueueRead("death", dist(rng), [&](ReadResult res) { completed_reads++; });
-            if (i % 5000 == 0) wait_for_queue(c);
+            if (i % 10000 == 0) wait_for_queue(c);
         }
         wait_for_queue(c);
-        std::cout << "      > " << label << " reads/sec: " << (READ_COUNT / (read_timer.elapsed_ms() / 1000.0)) << std::endl;
+        std::cout << "      > " << label << " reads t-total: " << read_timer.elapsed_ms() << " ms (" << (READ_COUNT / (read_timer.elapsed_ms() / 1000.0)) << " reads/sec)" << std::endl;
+
+        std::cout << "      > Full aggregate scan (cross-shard)..." << std::endl;
+        {
+            Timer t;
+            c.QueueFind("death", "noise1", std::string("missing_no_9999"), [](std::vector<ReadResult> results) {});
+            wait_for_queue(c);
+            std::cout << "      > Full Shard Scan took: " << t.elapsed_ms() << " ms" << std::endl;
+        }
     };
 
     try {
