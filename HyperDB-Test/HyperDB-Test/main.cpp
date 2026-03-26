@@ -1,3 +1,111 @@
+#define CLUSTER_PERF_TEST
+#ifdef CLUSTER_PERF_TEST
+#include "include/HyperDB.h"
+#include <iostream>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <random>
+
+// the "idc - dev" timer
+struct Timer {
+    std::chrono::high_resolution_clock::time_point start;
+    Timer() : start(std::chrono::high_resolution_clock::now()) {}
+    double elapsed_seconds() {
+        auto end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double>(end - start).count();
+    }
+};
+
+// optimized-ish noise generator
+// using mt19937 because rand() is a legacy joke from 1972
+std::string fast_noise(size_t len, std::mt19937& rng) {
+    static const char charset[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::uniform_int_distribution<int> dist(0, sizeof(charset) - 2);
+    std::string s;
+    s.reserve(len);
+    for (size_t i = 0; i < len; ++i) s += charset[dist(rng)];
+    return s;
+}
+
+void wait_for_queue(HyperDBCluster& cluster) {
+    while (!cluster.IsQueueEmpty()) {
+        std::this_thread::yield();
+    }
+}
+
+int main() {
+    std::mt19937 rng(static_cast<unsigned int>(std::time(nullptr)));
+    HyperDBCluster cluster;
+
+    const std::string PWD = "death";
+    const std::string FOLDER = "death_benchmark";
+    const size_t SHARD_LIMIT = 512ULL * 1024 * 1024; // 512MB shards
+    const int TOTAL_ROWS = 10000000;
+
+    std::cout << "--- STARTING 10,000,000 ROW APOCALYPSE ---" << std::endl;
+    std::cout << "[6:30PM] target: 3.8GB of raw encrypted entropy." << std::endl;
+    std::cout << "[6:30PM] shard limit: 512MB. pray for the manifest." << std::endl;
+
+    try {
+        Timer total_timer;
+
+        cluster.Open(FOLDER, "death", PWD, SHARD_LIMIT);
+        cluster.QueueCreateTable("death", {
+            {"noise1", HyperDB::ColumnType::ColumnType_String},
+            {"noise2", HyperDB::ColumnType::ColumnType_String},
+            {"noise3", HyperDB::ColumnType::ColumnType_String}
+            });
+        wait_for_queue(cluster);
+
+        Timer loop_timer;
+        for (int i = 1; i <= TOTAL_ROWS; ++i) {
+            cluster.QueueWrite("death", {
+                {"noise1", fast_noise(128, rng)},
+                {"noise2", fast_noise(128, rng)},
+                {"noise3", fast_noise(128, rng)}
+                });
+
+            // check memory sanity every 1M rows
+            if (i % 1000000 == 0) {
+                double pct = (static_cast<double>(i) / TOTAL_ROWS) * 100.0;
+                std::cout << "  > progress: " << (int)pct << "% (" << i << " rows queued)..." << std::endl;
+
+                // wait for background thread to catch up so we don't hit 32GB ram limit
+                // if we don't do this, the std::queue will swallow your entire OS.
+                // idc - dev.
+                wait_for_queue(cluster);
+            }
+        }
+
+        double loop_time = loop_timer.elapsed_seconds();
+        std::cout << "[6:XXPM] loop finished in " << loop_time << "s. flushing remaining data..." << std::endl;
+
+        Timer flush_timer;
+        cluster.ForceFlush(58253); // the magic iteration count
+        double flush_time = flush_timer.elapsed_seconds();
+
+        double total_time = total_timer.elapsed_seconds();
+
+        std::cout << "\n------------------------------------------" << std::endl;
+        std::cout << "BENCHMARK COMPLETE" << std::endl;
+        std::cout << "Total Time:    " << total_time << " seconds" << std::endl;
+        std::cout << "Write Throughput: " << (TOTAL_ROWS / loop_time) << " rows/sec" << std::endl;
+        std::cout << "Final Flush:   " << flush_time << " seconds" << std::endl;
+        std::cout << "Shard Count:   " << cluster.GetShardCount() << std::endl;
+        std::cout << "Total Rows:    " << cluster.GetRowCount("death") << std::endl;
+        std::cout << "------------------------------------------" << std::endl;
+        std::cout << "idc. go buy a new SSD." << std::endl;
+
+    }
+    catch (const std::exception& e) {
+        std::cerr << "SYSTEM FAILURE: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
+#else
 #include "include/HyperDB.h"
 #include <iostream>
 #include <iomanip>
@@ -180,3 +288,4 @@ int main() {
 
     return 0;
 }
+#endif
