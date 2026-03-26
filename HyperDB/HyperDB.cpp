@@ -493,15 +493,6 @@ void HyperDBManager::ExecRead(const std::string& table_name, uint64_t row_id, co
     if (callback) callback(std::move(result));
 }
 
-// ─────────────────────────────────────────
-// ExecFind — the function that used to be slow.
-// old approach: GetValueAtIndex() per row = boxing every element into a HyperValue variant.
-// that means heap allocations for strings, std::visit overhead, branch mispredicts. hell.
-//
-// new approach: dispatch once on col->type, then tight-loop over the raw typed vector.
-// no allocations in the hot path. no variants in the comparison. boost to the moon.
-// ─────────────────────────────────────────
-
 void HyperDBManager::ExecFind(const std::string& table_name, const std::string& col_name,
     const HyperValue& val,
     const std::function<void(std::vector<ReadResult>)>& callback) {
@@ -577,12 +568,6 @@ void HyperDBManager::ExecFind(const std::string& table_name, const std::string& 
 
     if (callback) callback(std::move(results));
 }
-
-// ─────────────────────────────────────────
-// ExecDelete — same optimization as ExecFind.
-// scan typed vector directly, collect indices, then erase in reverse.
-// erasing in reverse = no index invalidation. learned this from a bug that existed for 6 months.
-// ─────────────────────────────────────────
 
 void HyperDBManager::ExecDelete(const std::string& table_name, const std::string& col_name,
     const HyperValue& val, const std::function<void(int)>& callback) {

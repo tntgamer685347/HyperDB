@@ -114,7 +114,7 @@ void RunSoloTests() {
 
     {
         Timer t;
-        db.ForceFlush(58253);
+        db.ForceFlush(58253); // flush database with 58253 pbkdf2 iterations
         std::cout << "      > ForceFlush (Finalize) took: " << t.elapsed_ms() << " ms" << std::endl;
     }
 }
@@ -177,7 +177,7 @@ void RunClusterWriteBenchmark() {
 
     {
         Timer t;
-        cluster.ForceFlush(58253);
+        cluster.ForceFlush(58253); // flush database with 58253 pbkdf2 iterations
         std::cout << "      > Cluster Finalize (Flush All) took: " << t.elapsed_ms() << " ms" << std::endl;
     }
 }

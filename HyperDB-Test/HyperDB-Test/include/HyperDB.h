@@ -1,4 +1,9 @@
-﻿#pragma once
+﻿/*
+    HyperDB.h header file.
+    security: databases are only saved encrypted on disk. (aes-ctr+bcrypt+pbkdf2)
+*/
+
+#pragma once
 #define NOMINMAX
 
 #include <queue>
