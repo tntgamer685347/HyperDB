@@ -1,0 +1,104 @@
+// HyperDB FlatBuffers Schema
+// Table schemas are immutable after creation.
+// To change a table's structure, drop and recreate it.
+
+namespace HyperDB;
+
+// ─────────────────────────────────────────
+// Supported column types
+// ─────────────────────────────────────────
+
+enum ColumnType : byte {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    Bool,
+    String,
+    Bytes       // raw binary blob, useful for nested structures later
+}
+
+// ─────────────────────────────────────────
+// Column data storage (one vector per type)
+// ─────────────────────────────────────────
+
+table Int8Column    { values:[int8];    }
+table Int16Column   { values:[int16];   }
+table Int32Column   { values:[int32];   }
+table Int64Column   { values:[int64];   }
+table UInt8Column   { values:[uint8];   }
+table UInt16Column  { values:[uint16];  }
+table UInt32Column  { values:[uint32];  }
+table UInt64Column  { values:[uint64];  }
+table Float32Column { values:[float];   }
+table Float64Column { values:[double];  }
+table BoolColumn    { values:[bool];    }
+table StringColumn  { values:[string];  }
+table BytesColumn   { values:[string];  } // base64 or raw, your call at the app layer
+
+// ─────────────────────────────────────────
+// Union over all column data types
+// ─────────────────────────────────────────
+
+union ColumnData {
+    Int8Column,
+    Int16Column,
+    Int32Column,
+    Int64Column,
+    UInt8Column,
+    UInt16Column,
+    UInt32Column,
+    UInt64Column,
+    Float32Column,
+    Float64Column,
+    BoolColumn,
+    StringColumn,
+    BytesColumn
+}
+
+// ─────────────────────────────────────────
+// Column definition
+// name:  column name (unique within a table)
+// type:  enum tag so you can inspect type without unpacking the union
+// data:  the actual column data vector
+// ─────────────────────────────────────────
+
+table Column {
+    name:string     (required);
+    type:ColumnType;
+    data:ColumnData;
+}
+
+// ─────────────────────────────────────────
+// Table
+// Schema is fixed at creation time.
+// row_count tracks how many rows exist across all columns.
+// All columns must always have exactly row_count entries.
+// ─────────────────────────────────────────
+
+table Table {
+    name:string     (required);
+    columns:[Column];
+    row_count:uint64 = 0;
+}
+
+// ─────────────────────────────────────────
+// Database root
+// One database per .db file.
+// ─────────────────────────────────────────
+
+table Database {
+    name:string     (required);
+    tables:[Table];
+    version:uint32  = 1;    // bump this if you ever need a migration path
+}
+
+root_type Database;
+file_identifier "HYDB";     // 4-byte magic at the start of every .db file
+file_extension  "db";
