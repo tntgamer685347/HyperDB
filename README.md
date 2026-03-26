@@ -166,6 +166,19 @@ It tracks which row IDs live in which files using a `.manifest`, executing write
 
 ---
 
+## 🛠️ Shard Tuning (The "Sweet Spot" from the Trenches)
+Don't mess with the `shard_limit` unless you've actually slept recently. After 10,000,000 rows of testing, here is the gospel:
+
+| Shard Size | Result | Why? |
+| :--- | :--- | :--- |
+| **32 MB** | 💀 **Catastrophic** | You end up with 100+ `.db` files. Each one has its own worker thread. Your CPU will spend more time context-switching between 108 threads than actually reading your data. It's a "Thread Hunger Games" where everyone loses. |
+| **512 MB** | 🏆 **Pure W** | The magic middle. Low enough to avoid memory fragmentation, high enough to keep the thread count under 10. SSD flushes are manageable. |
+| **1.2 GB** | 🐌 **Sluggish** | Too much data in a single `std::vector`. Your CPU's TLB and cache will start screaming. Large memory blocks are a recipe for fragmentation and despair. |
+
+**Recommendation:** Stick to `512MB` or `1024MB`. Anything else is a cry for help.
+
+---
+
 ## ⚠️ Notes for the Brave
 
 1. **`HyperValue` Types**: This `std::variant` mirrors `HyperDB::ColumnType` exactly. If you add a type there and forget to update the `switch` statements in `HyperDB.cpp`, you will suffer. I guarantee it.

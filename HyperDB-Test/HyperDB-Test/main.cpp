@@ -126,7 +126,7 @@ void RunClusterWriteBenchmark() {
 
     const std::string PWD = "death";
     const std::string FOLDER = "death_benchmark";
-    const size_t SHARD_LIMIT = 512ULL * 1024 * 1024; 
+    const size_t SHARD_LIMIT = 512ULL * 1024 * 1024;
     const int TOTAL_ROWS = 10000000;
 
     std::cout << "  " << get_time_stamp() << " target: 3.8GB scale-out write..." << std::endl;
