@@ -52,7 +52,7 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 
 1. Include `HyperDB.h` in your project.
 2. Link against the compiled `HyperDB.lib` static library.
-3. **CRITICAL:** Ensure your project's include directories contain the `flatbuffers` headers and `hyperdb_generated.h`. The `.lib` statically links the Flatbuffers code, but the MSVC compiler still needs the headers to understand what a `flatbuffers::Offset` is when you try to compile. If your IDE lights up like a Christmas tree, this is why.
+3. **CRITICAL:** Ensure your project's include directories contain the `flatbuffers` headers and `hyperdb_generated.h`. The `.lib` statically links the Flatbuffers code, but the MSVC compiler still needs the headers to understand what a `flatbuffers::Offset` is when you try to compile. If your IDE lights up like a Christmas tree, this is why. (YOU DO NOT NEED THE flatbuffers.lib. its included in HyperDB.lib.)
 
 ---
 
