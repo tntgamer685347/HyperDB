@@ -174,8 +174,8 @@ class HyperDBManager {
 public:
     HyperDBManager() : queue_(this) {}
 
-    // open or create an encrypted db file. throws on wrong password or corrupt file.
-    void OpenDB(const std::string& path, const std::string& password);
+    // open or create a db file. throws on wrong password/corrupt data if encrypt=true.
+    void OpenDB(const std::string& path, const std::string& password = "", bool encrypt = true);
 
     // flush dirty mirror to disk. no-op if not dirty or interval hasn't elapsed.
     void FlushDB(uint32_t iterations = 58253);
@@ -233,6 +233,7 @@ private:
     DatabaseMirror       mirror_;
     std::string          db_path_;
     std::string          password_;
+    bool                 should_encrypt_ = true;
     std::vector<uint8_t> file_buffer_;
     std::mutex           data_mutex_;
     std::mutex           flush_mutex_;
@@ -254,8 +255,9 @@ public:
 
     // open or create a cluster in folder/. creates folder if needed.
     void Open(const std::string& folder, const std::string& name,
-        const std::string& password,
-        size_t shard_limit_bytes = DEFAULT_SHARD_LIMIT);
+        const std::string& password = "",
+        size_t shard_limit_bytes = DEFAULT_SHARD_LIMIT,
+        bool encrypt = true);
 
     void Flush(uint32_t iterations = 58253);
     void SetFlushInterval(int64_t ms);
@@ -296,6 +298,7 @@ private:
     std::string name_;
     std::string password_;
     std::string manifest_path_;
+    bool        should_encrypt_ = true;
     size_t      shard_limit_ = DEFAULT_SHARD_LIMIT;
     int         active_shard_index_ = 0;
 

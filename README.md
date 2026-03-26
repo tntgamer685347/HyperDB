@@ -17,9 +17,9 @@
 
 ## 💀 What is this?
 
-HyperDB is an in-memory, violently fast, flatbuffer-backed embedded database written in C++20. It was born from a 3AM debugging session and a deep hatred for latency. It features **O(1)** column lookups via `unordered_map`, a **`condition_variable`-driven persistent worker queue**, **bulk write batching**, and **PBKDF2-HMAC-SHA256 / AES-256-CTR** encryption that makes sure your data is safely locked away from everyone (sometimes including yourself).
+HyperDB is an in-memory, violently fast, flatbuffer-backed embedded database written in C++20. It was born from a 3AM debugging session and a deep hatred for latency. It features **O(1)** column lookups via `unordered_map`, a **`condition_variable`-driven persistent worker queue**, **bulk write batching**, and **optional PBKDF2-HMAC-SHA256 / AES-256-CTR** encryption — Fort Knox when you need it, raw FlatBuffers when you don't.
 
-If you are looking for an ACID compliant, highly scalable, enterprise-grade cloud solution... go use Postgres. If you want to serialize your vectors into encrypted binary blobs at 0.03ms per query while redlining your CPU's L3 cache... you're in the right place.
+If you are looking for an ACID compliant, highly scalable, enterprise-grade cloud solution... go use Postgres. If you want to serialize your vectors into flatbuffer blobs at 0.03ms per query while redlining your CPU's L3 cache... you're in the right place.
 
 ---
 
@@ -34,7 +34,7 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 - **`QueueDelete` Callback**: Delete now fires an `std::function<void(int)>` with the number of rows actually removed. The cluster uses this to call `ShiftManifestEntries` and keep global row IDs consistent. No more silently corrupt manifests after a delete.
 - **`ShiftManifestEntries`**: After a cross-shard delete, the cluster cascades the row count delta forward through all subsequent shard manifest entries. Global row ID resolution stays correct. This is the kind of thing that breaks at 10 million rows and not before.
 - **FlatBuffers Serialization**: Zero-copy deserialization. We generate offsets in reverse topological order. *Magic. Do not touch.*
-- **PBKDF2-HMAC-SHA256 & AES-256-CTR Encryption**: Because what good is a database if someone else can read it? Every file is encrypted using configurable key derivation iterations.
+- **Optional PBKDF2-HMAC-SHA256 & AES-256-CTR Encryption**: Fort Knox mode (`encrypt=true`, default) or Nitro Mode (`encrypt=false`). The cluster persists the choice in the `.manifest` so future shards don't forget what they are. Choose your destiny once. Don't switch halfway through.
 - **`HyperDBCluster` Auto-Sharding**: FlatBuffers has a 2GB hard limit. `HyperDBCluster` spills your data to new shards automatically, tracking row ID ranges per shard in a `.manifest` JSON file, executing writes on the active shard and fanning out `Find`/`Delete` queries transparently.
 
 ---
@@ -42,39 +42,43 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 ## 🚀 Performance Benchmarks
 *(Tested on an AMD Ryzen 7 5800X doing its best not to catch fire)*
 
-| Operation | Latency |
-| :--- | :--- |
-| **New DB Initialization** | `0.07 ms` |
-| **Unlock existing AES DB** (58k PBKDF2 iterations) | `42.87 ms` |
-| **QueueWrite (2 Rows)** | `0.04 ms` |
-| **QueueRead (Async Callback)** | `0.04 ms` |
-| **QueueFind (Search Logic)** | `0.03 ms` |
-| **Cross-Shard Find (Multi-shard aggregation)** | `0.04 ms` |
+| Operation | Encrypted | Nitro (Unencrypted) |
+| :--- | :--- | :--- |
+| **New DB Initialization** | `0.07 ms` | `0.06 ms` |
+| **Flush small DB to disk** | `43.65 ms` *(58k PBKDF2)* / `0.84 ms` *(1 iter)* | `0.28 ms` |
+| **QueueWrite (2 Rows)** | `0.04 ms` | `0.03 ms` |
+| **QueueRead (Async Callback)** | `0.04 ms` | `0.02 ms` |
+| **QueueFind (Search Logic)** | `0.03 ms` | `0.02 ms` |
+| **Cross-Shard Find (Multi-shard aggregation)** | `0.04 ms` | `0.04 ms` |
 
 ---
 
 ## 🌪️ 10,000,000 Row "Apocalypse" Benchmark
-*(3.8GB Encrypted Entropy | 512MB Shards | Ryzen 7 5800X)*
+*(4.2GB | 512MB Shards | Ryzen 7 5800X)*
 
-| Metric | Result |
-| :--- | :--- |
-| **Total Rows Written** | `10,000,000` |
-| **Throughput** | `92,842 rows/sec` |
-| **Total Data Size** | `4.2 GB` |
-| **Total Write Loop Time** | `107.7 seconds` |
-| **Final Shard Count** | `8 Shards` |
+| Metric | Encrypted (58k iter) | ⚡ Nitro Mode |
+| :--- | :--- | :--- |
+| **Total Rows Written** | `10,000,000` | `10,000,000` |
+| **Total Write Loop Time** | `109.9 seconds` | `32.1 seconds` |
+| **Throughput** | `~91,000 rows/sec` | `~311,000 rows/sec` |
+| **Cluster Finalize (Flush All)** | `1,721 ms` | `148 ms` |
+| **Total Data Size** | `4.2 GB` | `4.2 GB` |
+| **Final Shard Count** | `8 Shards` | `8 Shards` |
 
 ---
 
 ## 📖 "Read Apocalypse" Benchmark
 *(10M Row Dataset | 8 Shards (512MB each) | Ryzen 7 5800X)*
 
-| Operation | Latency / Throughput |
-| :--- | :--- |
-| **Random Global ID Read** | `5,212,430 reads/sec` |
-| **100,000 Random Reads** | `19.18 ms` |
-| **Full 4.2GB Multi-Shard Scan** | `8.50 ms` |
-| **Cross-Shard Aggregation** | `VERIFIED (10M rows / 8 Shards)` |
+| Operation | Encrypted | ⚡ Nitro Mode |
+| :--- | :--- | :--- |
+| **Cold Open (4.2GB, 8 shards)** | `~85 seconds` | `~7.8 seconds` |
+| **100,000 Random Reads** | `21.2 ms` | `21.2 ms` |
+| **Random Global ID Read** | `4,716,490 reads/sec` | `4,726,050 reads/sec` |
+| **Full 4.2GB Multi-Shard Scan** | `8.998 ms` | `8.459 ms` |
+| **Cross-Shard Aggregation** | `VERIFIED (10M rows / 8 Shards)` | `VERIFIED (10M rows / 8 Shards)` |
+
+Once the data is in memory, encrypted and unencrypted are basically the same speed. The `~77 second` difference is entirely the cold open — AES-256-CTR grinding through 4.2GB of ciphertext on load. In-memory operations don't care. They never did.
 
 ---
 
@@ -107,8 +111,13 @@ void wait_for_queue(T& db) {
 int main() {
     HyperDBManager db;
 
-    // 1. open or create the database using a top-secret password
+    // Fort Knox mode (default) — AES-256-CTR + PBKDF2. your data is a fortress.
+    // you will wait in line to get in. that's the deal.
     db.OpenDB("users.db", "sandwich");
+
+    // Nitro Mode — raw flatbuffers, no encryption, no PBKDF2, no regrets.
+    // if someone can read your db file, that's a you problem now.
+    // db.OpenDB("users.db", "sandwich", false);
 
     // 2. define the schema
     db.QueueCreateTable("users", {
@@ -133,8 +142,6 @@ int main() {
         });
 
     // 5. delete with a callback telling you how many rows were removed.
-    //    the cluster uses this internally to keep manifest row IDs in sync.
-    //    you can use it to know if the thing you deleted actually existed.
     db.QueueDelete("users", "username", std::string("batman"),
         [](int removed) {
             std::cout << "Deleted " << removed << " row(s).\n";
@@ -143,9 +150,9 @@ int main() {
     // 6. spin-wait until the dedicated worker thread drains the queue
     wait_for_queue(db);
 
-    // 7. force a synchronous disk flush
-    //    58253 iterations is the default. drop to 1 if you don't care about
-    //    brute-force resistance and do care about your sanity.
+    // 7. force a synchronous disk flush.
+    //    iterations only matter in Fort Knox mode. in Nitro Mode this is just
+    //    "please serialize my flatbuffer to disk." fast. painless. unencrypted.
     db.ForceFlush(58253);
 
     return 0;
@@ -156,14 +163,19 @@ int main() {
 
 ## 📦 Cluster Mode (Distributed Mojibake)
 
-If you're going to breach the ~2GB FlatBuffers limit of a single shard, `HyperDBCluster` handles cross-file tracking automatically. Use `QueueWriteBulk` for any serious ingestion — it batches N rows into a single lock acquisition on the worker queue instead of hammering the mutex one row at a time.
+If you're going to breach the ~2GB FlatBuffers limit of a single shard, `HyperDBCluster` handles cross-file tracking automatically. The `encrypt` flag is passed to `Open` and written to the `.manifest` — once a cluster is born unencrypted, it stays that way. You don't get to change your mind halfway through a 10 million row dataset.
 
 ```cpp
+// Fort Knox cluster — encrypted, slightly slower to open, definitely safer.
 HyperDBCluster cluster;
-// 512MB per shard — the sweet spot. see the tuning table below.
 cluster.Open("db_folder", "chaos", "death", 512ULL * 1024 * 1024);
 
-cluster.QueueCreateTable("system_logs", {
+// Nitro Mode cluster — raw flatbuffers, 7.8s cold open on 4GB instead of 85s.
+// the manifest remembers. future shards inherit the flag. there is no going back.
+HyperDBCluster fast_cluster;
+fast_cluster.Open("db_folder", "chaos", "death", 512ULL * 1024 * 1024, false);
+
+fast_cluster.QueueCreateTable("system_logs", {
     {"log_id",  HyperDB::ColumnType::ColumnType_Int64},
     {"message", HyperDB::ColumnType::ColumnType_String}
 });
@@ -180,7 +192,7 @@ for (int i = 0; i < 10000; ++i) {
         {"message", std::string("log entry")}
     });
 }
-cluster.QueueWriteBulk("system_logs", std::move(batch));
+fast_cluster.QueueWriteBulk("system_logs", std::move(batch));
 ```
 
 The cluster tracks which row IDs live in which files via a `.manifest` JSON file, executing writes on the active shard and proxying `Find`/`Delete` queries transparently across all files. Deletes cascade a row count delta through subsequent manifest entries via `ShiftManifestEntries` so global row ID resolution stays valid after rows are removed.
@@ -227,44 +239,44 @@ If you're building a website for a million concurrent users, use a real server d
 ## 🗄️ Dataset Speed Expectations (The "Cold Start" Tax)
 
 - **Sweet Spot (10 – 500,000 Rows)**: HyperDB is an absolute god. Loads instantly, saves instantly, scans are basically free. This is the core target.
-- **The Millionaire Problem (1M – 10M Rows)**: Once you cross a million rows in a single table, the **Cold Start Tax** kicks in. Your app will still crunch that data in milliseconds — but **loading and saving** will take 15–100 seconds. The culprit at scale is not what you think.
+- **The Millionaire Problem (1M – 10M Rows, encrypted)**: The **Cold Start Tax** kicks in hard. Loading 4.2GB means AES-256-CTR decrypting every byte before a single query can run. That's ~85 seconds on a Ryzen 7 5800X. Your app will feel like it's thinking very hard about its choices.
+- **The Millionaire Problem (1M – 10M Rows, Nitro Mode)**: Cold open drops to **~7.8 seconds**. That's raw SSD read speed. No AES pipeline. No PBKDF2. Just `fread` and a `flatbuffers::Verifier` doing its thing. The difference is not subtle.
 
-**Summary:** If your app can afford a "Loading..." screen at boot, go crazy. If not, keep shards lean and row counts under a million per cluster.
+**Summary:** If the data needs to be secret, pay the tax. If it doesn't, flip the flag and stop watching a progress bar at 3AM.
 
 ---
 
-## ⚡ Speed Hack (Security vs. Sanity) — and the Uncomfortable Truth
+## ⚡ Encryption Mode vs. Nitro Mode — Pick Your Poison
 
-Here's what the benchmark actually showed with 4.2GB across 8 shards:
+Three ways to run HyperDB. One is a fortress. One is a racecar. One is a racecar that once was a fortress and now lives in denial.
 
-| Config | Cold Open |
-| :--- | :--- |
-| **58,253 PBKDF2 iterations** | `~85 seconds` |
-| **1 PBKDF2 iteration** | `~83 seconds` |
+| Config | Cold Open (4.2GB) | Flush (small DB) | Your data if someone steals the file |
+| :--- | :--- | :--- | :--- |
+| **Fort Knox** (58k PBKDF2 iter) | `~85 seconds` | `~43 ms` | Completely unreadable. You win. |
+| **Unlocked Fort Knox** (1 iter) | `~83 seconds` | `~0.84 ms` | Trivially brute-forceable. You saved 2 seconds. Congratulations. |
+| **⚡ Nitro Mode** (no encryption) | `~7.8 seconds` | `~0.28 ms` | Plaintext flatbuffer. Readable by anyone with a hex editor and bad intentions. |
 
-Yeah. **Two seconds.** Out of eighty-three.
+The Cold Start Tax at scale is **AES-256-CTR grinding through gigabytes of ciphertext**. PBKDF2 derives a 32-byte key — microseconds at any sane iteration count. The decryption pass is a physics problem. Your CPU is moving 4.2GB through its AES-NI pipeline and that number does not negotiate regardless of what you put in the `iterations` field.
 
-The Cold Start Tax at scale is almost entirely the cost of **AES-256-CTR decrypting gigabytes of ciphertext**. PBKDF2 derives a 32-byte key — that's microseconds at any sane iteration count. The decryption pass over 588MB × 8 shard files is a physics problem. Your CPU is moving 4.2GB through its AES-NI pipeline no matter what the iteration count says. That number doesn't negotiate.
+Dropping from 58k iterations to 1 saves you **~2 seconds** on a 4.2GB open. That's 2.4% of the problem. If that's your performance strategy, you've misread the situation.
 
-**Where PBKDF2 iterations actually matter:**
-
-- **Small databases (< ~100MB)**: The key derivation dominates. 58k iterations costs you ~43ms on a fresh flush. Drop to `1` and it's sub-millisecond. Meaningful difference.
-- **Large databases (1GB+)**: AES throughput is the wall. Changing iterations from 58k to 1 saves you maybe 2%. Don't rewrite your threat model around it.
+**Nitro Mode saves you ~77 seconds.** That's the real number. That's AES leaving the room entirely.
 
 ```cpp
-// security mode — brute-force resistant key derivation.
-// costs you ~43ms on small dbs. costs you ~2s on 4GB. pick your poison.
-db.ForceFlush(58253);
+// fort knox — your data is safe. your cold open is not.
+db.OpenDB("users.db", "sandwich");           // encrypt = true (default)
+cluster.Open("folder", "db", "sandwich", 512ULL*1024*1024);  // ditto
 
-// speed mode — key derives in microseconds.
-// the 83 seconds you're still waiting? that's your 4GB of ciphertext.
-// physics doesn't care about your iteration count. it never did.
-db.ForceFlush(1);
+// nitro mode — raw flatbuffers. no aes. no pbkdf2. no waiting.
+// the manifest remembers this choice. all future shards inherit it.
+// there is no migration path. choose wisely and don't come crying to me.
+db.OpenDB("users.db", "sandwich", false);
+cluster.Open("folder", "db", "sandwich", 512ULL*1024*1024, false);
 ```
 
-**The real speed hack for large databases** is keeping shard sizes small enough that each cold open only decrypts what it needs. A 512MB shard opens in roughly 10 seconds. A 1.5GB shard opens in roughly 30. That math is linear and unforgiving.
-
-Choose your iteration count based on your actual threat model, not your open time. For large encrypted datasets, your open time is an AES problem either way.
+**Rule of thumb:**
+- Data that would embarrass you, get you sued, or start a federal investigation → Fort Knox.
+- Local dev data, temp buffers, anything that lives and dies on your own machine → Nitro Mode. Stop paying the encryption tax for data nobody wants anyway.
 
 ---
 
@@ -274,9 +286,9 @@ Choose your iteration count based on your actual threat model, not your open tim
 
 | Method | Description |
 | :--- | :--- |
-| `OpenDB(path, password)` | Open or create an encrypted database file. Throws on wrong password or corrupt data. |
-| `FlushDB(iterations)` | Serialize and encrypt the mirror to disk. No-op if not dirty or interval hasn't elapsed. |
-| `ForceFlush(iterations)` | Override interval and flush immediately. |
+| `OpenDB(path, password, encrypt=true)` | Open or create a database file. `encrypt=false` skips AES/PBKDF2 entirely — raw FlatBuffers, no cold start tax, no protection. Throws on wrong password or corrupt data in encrypted mode. |
+| `FlushDB(iterations)` | Serialize mirror to disk. Encrypts if `encrypt=true`, writes raw if not. No-op if not dirty or interval hasn't elapsed. |
+| `ForceFlush(iterations)` | Override interval and flush immediately. `iterations` is ignored in Nitro Mode. |
 | `SetFlushInterval(ms)` | Minimum milliseconds between flushes. `0` = always flush. |
 | `QueueCreateTable(name, cols)` | Define a table schema. Ignored if the table already exists. |
 | `QueueDropTable(name)` | Remove a table and all its data. |
@@ -295,7 +307,7 @@ Choose your iteration count based on your actual threat model, not your open tim
 
 | Method | Description |
 | :--- | :--- |
-| `Open(folder, name, password, shard_limit)` | Open or create a sharded cluster. Creates `folder/` if needed. |
+| `Open(folder, name, password, shard_limit, encrypt=true)` | Open or create a sharded cluster. The `encrypt` flag is stored in the `.manifest` — all future shards inherit it. You cannot change modes on an existing cluster. Creates `folder/` if needed. |
 | `QueueWriteBulk(table, rows)` | Batch write. Handles shard spillover across the batch automatically. |
 | `QueueRead(table, global_row_id, cb)` | Resolves global row ID to the correct shard and local index via manifest. |
 | `QueueFind(table, col, value, cb, target)` | Fan-out find across shards matching `target`. Merges results when all return. |
@@ -315,19 +327,21 @@ Choose your iteration count based on your actual threat model, not your open tim
 
 ## ⚠️ Notes for the Brave
 
-1. **`QueueDelete` now has a callback.** `void QueueDelete(table, col, value, callback)` fires `callback(int removed)` with the number of rows deleted. The cluster depends on this for manifest consistency. If you're using `HyperDBManager` directly and deleting from sharded data, you want this number. Pass `nullptr` if you genuinely don't care, which is allowed.
+1. **Encryption is now optional.** Pass `encrypt=false` to `OpenDB` or `Open` for Nitro Mode. The flag is stored in the cluster `.manifest` and inherited by all future shards. You cannot open an encrypted cluster as unencrypted or vice versa — the verifier will throw. Once you've chosen a mode, you've chosen it forever. Or until you delete the files. Same thing.
 
-2. **`HyperValue` Types**: This `std::variant` mirrors `HyperDB::ColumnType` exactly. If you add a type there and forget to update the `switch` statements in `HyperDB.cpp`, you will suffer. This is not a threat. It is a prophecy.
+2. **`QueueDelete` now has a callback.** `void QueueDelete(table, col, value, callback)` fires `callback(int removed)` with the number of rows deleted. The cluster depends on this for manifest consistency. If you're using `HyperDBManager` directly and deleting from sharded data, you want this number. Pass `nullptr` if you genuinely don't care, which is allowed.
 
-3. **`QueueWriteBulk` vs. `QueueWrite`**: `QueueWrite` acquires the mutex once per row. `QueueWriteBulk` acquires it once for the entire batch. At 10,000 rows per batch and 10 million total rows, that's the difference between 10,000 lock acquisitions and 10,000,000. The benchmark numbers are not magic. They are arithmetic.
+3. **`HyperValue` Types**: This `std::variant` mirrors `HyperDB::ColumnType` exactly. If you add a type there and forget to update the `switch` statements in `HyperDB.cpp`, you will suffer. This is not a threat. It is a prophecy.
 
-4. **`IsQueueEmpty()` Spin-Waiting**: Always `yield()` inside your wait loop. Without it, your main thread will starve the worker thread on the L3 cache by hammering the atomic counter. This seems like it shouldn't matter until it does, at which point you're staring at a performance cliff with no explanation.
+4. **`QueueWriteBulk` vs. `QueueWrite`**: `QueueWrite` acquires the mutex once per row. `QueueWriteBulk` acquires it once for the entire batch. At 10,000 rows per batch and 10 million total rows, that's the difference between 10,000 lock acquisitions and 10,000,000. The benchmark numbers are not magic. They are arithmetic.
 
-5. **The `estimated_size_` counter**: `HyperDBManager` maintains a running estimate of mirror size, updated on every write, delete, and clear. `MaybeSpillToNewShard` uses this instead of summing every column on every call. At 88k writes/sec this matters. The estimate can drift slightly after edge cases, but it's close enough for shard spillover decisions where the limit has megabytes of headroom anyway.
+5. **`IsQueueEmpty()` Spin-Waiting**: Always `yield()` inside your wait loop. Without it, your main thread will starve the worker thread on the L3 cache by hammering the atomic counter. This seems like it shouldn't matter until it does, at which point you're staring at a performance cliff with no explanation.
 
-6. **`ShiftManifestEntries`**: After a delete, the cluster adjusts the `row_end` of the affected shard's manifest entry and cascades the delta to all subsequent shard boundaries. If you bypass this — by calling `ExecDelete` directly on a shard managed by a cluster, for example — your global row IDs will silently drift out of alignment. Don't do that.
+6. **The `estimated_size_` counter**: `HyperDBManager` maintains a running estimate of mirror size, updated on every write, delete, and clear. `MaybeSpillToNewShard` uses this instead of summing every column on every call. At 311k writes/sec in Nitro Mode this matters. The estimate can drift slightly after edge cases, but it's close enough for shard spillover decisions where the limit has megabytes of headroom anyway.
 
-7. **Thread Safety**: All `Exec*` methods are serialized through the single worker thread per shard. `FlushDB` has its own `flush_mutex_` to prevent concurrent flushes. `data_mutex_` protects the mirror during all read/write operations. Do not call `Exec*` methods directly. That's what the queue is for. The queue is not optional.
+7. **`ShiftManifestEntries`**: After a delete, the cluster adjusts the `row_end` of the affected shard's manifest entry and cascades the delta to all subsequent shard boundaries. If you bypass this — by calling `ExecDelete` directly on a shard managed by a cluster, for example — your global row IDs will silently drift out of alignment. Don't do that.
+
+8. **Thread Safety**: All `Exec*` methods are serialized through the single worker thread per shard. `FlushDB` has its own `flush_mutex_` to prevent concurrent flushes. `data_mutex_` protects the mirror during all read/write operations. Do not call `Exec*` methods directly. That's what the queue is for. The queue is not optional.
 
 <div align="center">
 <i>Maintained by someone deeply regretting their life choices.</i>

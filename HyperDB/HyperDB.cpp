@@ -136,9 +136,11 @@ void HyperDBQueue::Execute(QueueEntry entry) {
 // HyperDBManager — file i/o
 // ═════════════════════════════════════════
 
-void HyperDBManager::OpenDB(const std::string& path, const std::string& password) {
-    db_path_  = path;
-    password_ = password;
+void HyperDBManager::OpenDB(const std::string& path, const std::string& password, bool encrypt) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    db_path_        = path;
+    password_       = password;
+    should_encrypt_ = encrypt;
 
     if (!std::filesystem::exists(path)) {
         // new db — create fresh mirror. we'll serialize it on first flush.
@@ -154,41 +156,50 @@ void HyperDBManager::OpenDB(const std::string& path, const std::string& password
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
 
-    std::vector<uint8_t> encrypted(static_cast<size_t>(size));
-    file.read(reinterpret_cast<char*>(encrypted.data()), size);
+    if (!should_encrypt_) {
+        // assume raw flatbuffer
+        file_buffer_.resize(static_cast<size_t>(size));
+        file.read(reinterpret_cast<char*>(file_buffer_.data()), size);
+        
+        flatbuffers::Verifier verifier(file_buffer_.data(), file_buffer_.size());
+        if (!HyperDB::VerifyDatabaseBuffer(verifier)) 
+            throw std::runtime_error("HyperDB: failed to verify unencrypted database: " + path);
+            
+        DeserializeToMirror(HyperDB::GetDatabase(file_buffer_.data()));
+        return;
+    }
 
-    // layout: [salt:16][iv:16][iterations:4][ciphertext...]
-    if (encrypted.size() < 36) throw std::runtime_error("HyperDB: file too small to be valid.");
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(data.data()), size);
 
-    uint8_t  salt[16], iv[16];
-    uint32_t iterations = 0;
-    std::memcpy(salt,       encrypted.data(),      16);
-    std::memcpy(iv,         encrypted.data() + 16, 16);
-    std::memcpy(&iterations, encrypted.data() + 32, 4);
+    if (data.size() < 36) throw std::runtime_error("HyperDB: file too small to be valid.");
+
+    uint8_t salt[16], iv[16];
+    uint32_t its = 0;
+    std::memcpy(salt, data.data(), 16);
+    std::memcpy(iv, data.data() + 16, 16);
+    std::memcpy(&its, data.data() + 32, 4);
 
     uint8_t key[32];
-    PKCS5_PBKDF2_HMAC(
-        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(password.c_str())),
-        password.length(), salt, 16, iterations, 32, key
-    );
+    PKCS5_PBKDF2_HMAC(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(password.c_str())), password.length(), salt, 16, its, 32, key);
 
-    size_t cipher_len = encrypted.size() - 36;
+    size_t cipher_len = data.size() - 36;
     file_buffer_.resize(cipher_len);
-    std::memcpy(file_buffer_.data(), encrypted.data() + 36, cipher_len);
+    std::memcpy(file_buffer_.data(), data.data() + 36, cipher_len);
 
     AES_ctx ctx;
     AES_init_ctx_iv(&ctx, key, iv);
     AES_CTR_xcrypt_buffer(&ctx, file_buffer_.data(), static_cast<uint32_t>(cipher_len));
 
-    flatbuffers::Verifier verifier(file_buffer_.data(), file_buffer_.size());
-    if (!HyperDB::VerifyDatabaseBuffer(verifier))
-        throw std::runtime_error("HyperDB: wrong password or corrupt file.");
+    flatbuffers::Verifier v(file_buffer_.data(), file_buffer_.size());
+    if (!HyperDB::VerifyDatabaseBuffer(v)) throw std::runtime_error("HyperDB: wrong password or corrupt file.");
 
     DeserializeToMirror(HyperDB::GetDatabase(file_buffer_.data()));
 }
 
 void HyperDBManager::FlushDB(uint32_t iterations) {
     if (!dirty_) return;
+    std::lock_guard<std::mutex> lock_f(flush_mutex_);
 
     if (flush_interval_ms_ > 0) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -196,37 +207,42 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
         if (ms < flush_interval_ms_) return;
     }
 
-    std::lock_guard<std::mutex> lock(flush_mutex_);
-
     flatbuffers::FlatBufferBuilder builder(1024 * 1024);
-    auto db_offset = SerializeFromMirror(builder);
-    builder.Finish(db_offset, HyperDB::DatabaseIdentifier());
-
-    uint8_t salt[16], iv[16];
-    SecureRandomBytes(salt, 16);
-    SecureRandomBytes(iv,   16);
-
-    uint8_t key[32];
-    PKCS5_PBKDF2_HMAC(
-        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(password_.c_str())),
-        password_.length(), salt, 16, iterations, 32, key
-    );
-
-    size_t               plain_len = builder.GetSize();
-    std::vector<uint8_t> cipher(plain_len);
-    std::memcpy(cipher.data(), builder.GetBufferPointer(), plain_len);
-
-    AES_ctx ctx;
-    AES_init_ctx_iv(&ctx, key, iv);
-    AES_CTR_xcrypt_buffer(&ctx, cipher.data(), static_cast<uint32_t>(plain_len));
+    {
+        std::lock_guard<std::mutex> lock_d(data_mutex_);
+        auto db_offset = SerializeFromMirror(builder);
+        builder.Finish(db_offset, HyperDB::DatabaseIdentifier());
+    }
 
     std::ofstream file(db_path_, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) throw std::runtime_error("HyperDB: failed to write " + db_path_);
 
-    file.write(reinterpret_cast<const char*>(salt),           16);
-    file.write(reinterpret_cast<const char*>(iv),             16);
-    file.write(reinterpret_cast<const char*>(&iterations),     4);
-    file.write(reinterpret_cast<const char*>(cipher.data()), static_cast<std::streamsize>(plain_len));
+    if (!should_encrypt_) {
+        file.write(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
+    } else {
+        uint8_t salt[16], iv[16];
+        SecureRandomBytes(salt, 16);
+        SecureRandomBytes(iv,   16);
+
+        uint8_t key[32];
+        PKCS5_PBKDF2_HMAC(
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(password_.c_str())),
+            password_.length(), salt, 16, iterations, 32, key
+        );
+
+        size_t               plain_len = builder.GetSize();
+        std::vector<uint8_t> cipher(plain_len);
+        std::memcpy(cipher.data(), builder.GetBufferPointer(), plain_len);
+
+        AES_ctx ctx;
+        AES_init_ctx_iv(&ctx, key, iv);
+        AES_CTR_xcrypt_buffer(&ctx, cipher.data(), static_cast<uint32_t>(plain_len));
+
+        file.write(reinterpret_cast<const char*>(salt),           16);
+        file.write(reinterpret_cast<const char*>(iv),             16);
+        file.write(reinterpret_cast<const char*>(&iterations),     4);
+        file.write(reinterpret_cast<const char*>(cipher.data()), static_cast<std::streamsize>(plain_len));
+    }
 
     dirty_           = false;
     last_flush_time_ = std::chrono::steady_clock::now();
@@ -792,18 +808,9 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database* db) {
         }
         mirror_.tables.push_back(std::move(tm));
     }
-    estimated_size_ = EstimateMirrorSize(); // wait, we have to recurse one last time. 
-    // actually, let's just do it right here since this is deser.
-    size_t s = 0;
-    for (auto& t : mirror_.tables) {
-        s += t.name.size();
-        for (auto& c : t.columns) {
-            s += c.name.size();
-            s += c.i8.size() + c.i16.size()*2 + c.i32.size()*4 + c.i64.size()*8 + c.u8.size() + c.u16.size()*2 + c.u32.size()*4 + c.u64.size()*8 + c.f32.size()*4 + c.f64.size()*8 + c.bools.size();
-            for (auto& str : c.strings) s += str.size();
-        }
-    }
-    estimated_size_ = s;
+    // we already accumulated the size in 'estimated_size_' during the loops.
+    // do not call the locked EstimateMirrorSize() here or we'll deadlock our own open call.
+    // life is hard enough as it is.
 }
 
 // ═════════════════════════════════════════
@@ -812,12 +819,14 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database* db) {
 
 void HyperDBCluster::Open(const std::string& folder, const std::string& name,
                            const std::string& password,
-                           size_t shard_limit_bytes) {
-    folder_        = folder;
-    name_          = name;
-    password_      = password;
-    shard_limit_   = shard_limit_bytes;
-    manifest_path_ = folder + "/" + name + ".manifest";
+                           size_t shard_limit_bytes,
+                           bool encrypt) {
+    folder_         = folder;
+    name_           = name;
+    password_       = password;
+    shard_limit_    = shard_limit_bytes;
+    should_encrypt_ = encrypt;
+    manifest_path_  = folder + "/" + name + ".manifest";
 
     std::filesystem::create_directories(folder);
 
@@ -985,7 +994,7 @@ std::string HyperDBCluster::ShardPath(int index) const {
 void HyperDBCluster::OpenShard(int index) {
     while (static_cast<int>(shards_.size()) <= index)
         shards_.push_back(std::make_unique<HyperDBManager>());
-    shards_[index]->OpenDB(ShardPath(index), password_);
+    shards_[index]->OpenDB(ShardPath(index), password_, should_encrypt_);
 }
 
 HyperDBManager& HyperDBCluster::ActiveShard() {
@@ -1042,9 +1051,10 @@ void HyperDBCluster::ForEachShard(ShardTarget target, std::function<void(HyperDB
 
 void HyperDBCluster::SaveManifest() {
     json j;
-    j["active_shard"] = active_shard_index_;
-    j["shard_count"]  = static_cast<int>(shards_.size());
-    j["shard_limit"]  = shard_limit_;
+    j["active_shard"]   = active_shard_index_;
+    j["shard_count"]    = static_cast<int>(shards_.size());
+    j["shard_limit"]    = shard_limit_;
+    j["should_encrypt"] = should_encrypt_;
 
     json tables = json::object();
     for (auto& [table_name, entries] : manifest_tables_) {
@@ -1071,6 +1081,8 @@ void HyperDBCluster::LoadManifest() {
     active_shard_index_ = j["active_shard"].get<int>();
     if (j.contains("shard_limit"))
         shard_limit_ = j["shard_limit"].get<size_t>();
+    if (j.contains("should_encrypt"))
+        should_encrypt_ = j["should_encrypt"].get<bool>();
 
     manifest_tables_.clear();
     for (auto& [table_name, arr] : j["tables"].items()) {
