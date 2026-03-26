@@ -126,9 +126,9 @@ void HyperDBQueue::Execute(QueueEntry entry) {
     case QueueActionType::ClearTable:     manager_->ExecClearTable(entry.table_name);                                                break;
     case QueueActionType::ClearColumn:    manager_->ExecClearColumn(entry.table_name, entry.column_name);                            break;
     case QueueActionType::Write:          manager_->ExecWrite(entry.table_name, entry.row_data);                                     break;
-    case QueueActionType::Read:           manager_->ExecRead(entry.table_name, entry.row_id, entry.callback);                        break;
-    case QueueActionType::Find:           manager_->ExecFind(entry.table_name, entry.column_name, entry.value, entry.find_callback); break;
-    case QueueActionType::Delete:         manager_->ExecDelete(entry.table_name, entry.column_name, entry.value);                    break;
+    case QueueActionType::Read:           manager_->ExecRead(entry.table_name, entry.row_id, entry.callback);                                     break;
+    case QueueActionType::Find:           manager_->ExecFind(entry.table_name, entry.column_name, entry.value, entry.find_callback);              break;
+    case QueueActionType::Delete:         manager_->ExecDelete(entry.table_name, entry.column_name, entry.value, entry.delete_callback);          break;
     }
 }
 
@@ -284,8 +284,8 @@ void HyperDBManager::QueueRead(const std::string& table_name, uint64_t row_id, s
 void HyperDBManager::QueueFind(const std::string& table_name, const std::string& column_name, HyperValue value, std::function<void(std::vector<ReadResult>)> callback) {
     queue_.AddToQueue(QueueEntry{ .action = QueueActionType::Find, .table_name = table_name, .column_name = column_name, .value = std::move(value), .find_callback = std::move(callback) });
 }
-void HyperDBManager::QueueDelete(const std::string& table_name, const std::string& column_name, HyperValue value) {
-    queue_.AddToQueue(QueueEntry{ .action = QueueActionType::Delete, .table_name = table_name, .column_name = column_name, .value = std::move(value) });
+void HyperDBManager::QueueDelete(const std::string& table_name, const std::string& column_name, HyperValue value, std::function<void(int)> callback) {
+    queue_.AddToQueue(QueueEntry{ .action = QueueActionType::Delete, .table_name = table_name, .column_name = column_name, .value = std::move(value), .delete_callback = std::move(callback) });
 }
 
 // ═════════════════════════════════════════
@@ -531,7 +531,7 @@ void HyperDBManager::ExecFind(const std::string& table_name, const std::string& 
 // ─────────────────────────────────────────
 
 void HyperDBManager::ExecDelete(const std::string& table_name, const std::string& col_name,
-    const HyperValue& val) {
+    const HyperValue& val, const std::function<void(int)>& callback) {
 
     std::lock_guard<std::mutex> lock(data_mutex_);
     TableMirror*  table = FindTable(table_name);
@@ -582,7 +582,12 @@ void HyperDBManager::ExecDelete(const std::string& table_name, const std::string
     default: break;
     }
 
-    if (to_delete.empty()) return;
+    if (to_delete.empty()) {
+        if (callback) callback(0);
+        return;
+    }
+
+    int count = static_cast<int>(to_delete.size());
 
     // erase in reverse so indices don't shift under us.
     // this code has been here since 2023. don't fucking touch it.
@@ -606,8 +611,9 @@ void HyperDBManager::ExecDelete(const std::string& table_name, const std::string
             }
         }
     }
-    table->row_count -= to_delete.size();
+    table->row_count -= count;
     dirty_ = true;
+    if (callback) callback(count);
 }
 
 // ═════════════════════════════════════════
@@ -875,7 +881,12 @@ void HyperDBCluster::QueueFind(const std::string& table_name, const std::string&
 }
 
 void HyperDBCluster::QueueDelete(const std::string& table_name, const std::string& column_name, HyperValue value, ShardTarget target) {
-    ForEachShard(target, [&](HyperDBManager& shard) { shard.QueueDelete(table_name, column_name, value); });
+    auto indices = GetShardIndices(target);
+    for (int idx : indices) {
+        shards_[idx]->QueueDelete(table_name, column_name, value, [this, table_name, idx](int count) {
+            if (count > 0) ShiftManifestEntries(table_name, idx, -count);
+        });
+    }
 }
 
 int HyperDBCluster::GetRowCount(const std::string& table_name) {
@@ -998,3 +1009,26 @@ void HyperDBCluster::LoadManifest() {
         manifest_tables_[table_name] = std::move(entries);
     }
 }
+
+void HyperDBCluster::ShiftManifestEntries(const std::string& table_name, int from_shard_index, int delta) {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    auto it = manifest_tables_.find(table_name);
+    if (it == manifest_tables_.end()) return;
+
+    auto& entries = it->second;
+    bool found = false;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries[i].shard_index == from_shard_index) {
+            entries[i].row_end += delta;
+            found = true;
+            // cascade the shift to all subsequent shard boundaries
+            for (size_t j = i + 1; j < entries.size(); ++j) {
+                entries[j].row_start += delta;
+                entries[j].row_end   += delta;
+            }
+            break;
+        }
+    }
+    if (found) SaveManifest();
+}
+

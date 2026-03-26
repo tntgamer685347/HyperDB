@@ -107,6 +107,7 @@ struct QueueEntry {
     ShardTarget                                  target = ShardTarget::All;
     std::function<void(ReadResult)>              callback = nullptr;
     std::function<void(std::vector<ReadResult>)> find_callback = nullptr;
+    std::function<void(int)>                     delete_callback = nullptr;
 };
 
 // in-memory mirror structs — parallel arrays per type.
@@ -192,7 +193,7 @@ public:
     void QueueWriteBulk(const std::string& table_name, std::vector<std::vector<RowData>> rows);
     void QueueRead(const std::string& table_name, uint64_t row_id, std::function<void(ReadResult)> callback);
     void QueueFind(const std::string& table_name, const std::string& column_name, HyperValue value, std::function<void(std::vector<ReadResult>)> callback);
-    void QueueDelete(const std::string& table_name, const std::string& column_name, HyperValue value);
+    void QueueDelete(const std::string& table_name, const std::string& column_name, HyperValue value, std::function<void(int)> callback = nullptr);
 
     // synchronous read-only accessors (lock-safe)
     int    GetRowCount(const std::string& table_name);
@@ -212,7 +213,7 @@ public:
     void ExecWrite(const std::string& table_name, const std::vector<RowData>& row);
     void ExecRead(const std::string& table_name, uint64_t row_id, const std::function<void(ReadResult)>& callback);
     void ExecFind(const std::string& table_name, const std::string& col_name, const HyperValue& val, const std::function<void(std::vector<ReadResult>)>& callback);
-    void ExecDelete(const std::string& table_name, const std::string& col_name, const HyperValue& val);
+    void ExecDelete(const std::string& table_name, const std::string& col_name, const HyperValue& val, const std::function<void(int)>& callback = nullptr);
 
 private:
     TableMirror* FindTable(const std::string& name);
@@ -287,6 +288,7 @@ private:
     void             ForEachShard(ShardTarget target, std::function<void(HyperDBManager&)> fn);
     void             SaveManifest();
     void             LoadManifest();
+    void             ShiftManifestEntries(const std::string& table_name, int from_shard_index, int delta);
 
     std::string folder_;
     std::string name_;
@@ -298,4 +300,5 @@ private:
     std::vector<std::unique_ptr<HyperDBManager>>                  shards_;
     std::unordered_map<std::string, std::vector<ShardTableEntry>> manifest_tables_;
     std::unordered_map<std::string, std::vector<ColumnDef>>       cluster_schemas_;
+    std::mutex                                                    manifest_mutex_;
 };
