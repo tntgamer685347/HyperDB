@@ -75,8 +75,8 @@ void HyperDBQueue::AddToQueue(QueueEntry entry) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     queue_.push(std::move(entry));
+    queue_size_++;
   }
-  queue_size_++;
   cv_.notify_one();
 }
 
@@ -88,8 +88,8 @@ void HyperDBQueue::AddToQueueBulk(std::vector<QueueEntry> entries) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto &e : entries)
       queue_.push(std::move(e));
+    queue_size_ += count;
   }
-  queue_size_ += count;
   cv_.notify_one();
 }
 
@@ -121,17 +121,23 @@ void HyperDBQueue::ProcessQueue() {
     }
 
     if (has_entry) {
+      try {
 #ifdef BUILD_PYTHON_MODULE
-      if (is_callback_action) {
-        pybind11::gil_scoped_acquire acquire;
-        Execute(std::move(entry));
-      } else {
-        Execute(std::move(entry));
-      }
+        if (is_callback_action) {
+          pybind11::gil_scoped_acquire acquire;
+          Execute(std::move(entry));
+        } else {
+          Execute(std::move(entry));
+        }
 #else
-      (void)is_callback_action;
-      Execute(std::move(entry));
+        (void)is_callback_action;
+        Execute(std::move(entry));
 #endif
+      } catch (const std::exception &e) {
+        // if we crash here, the worker thread would die and take the shard
+        // with it. we choose life.
+        printf("HYPERDB CRITICAL: Worker thread exception: %s\n", e.what());
+      }
       worker_busy_ = false;
     }
   }
@@ -157,6 +163,9 @@ void HyperDBQueue::Execute(QueueEntry entry) {
   case QueueActionType::Write:
     manager_->ExecWrite(entry.table_name, entry.row_data);
     break;
+  case QueueActionType::WriteBulk:
+      manager_->ExecWriteBulk(entry.table_name, entry.row_data_bulk);
+      break;
   case QueueActionType::Read:
     manager_->ExecRead(entry.table_name, entry.row_id, entry.callback);
     break;
@@ -208,6 +217,8 @@ void HyperDBManager::OpenDB(const std::string &path,
           "HyperDB: failed to verify unencrypted database: " + path);
 
     DeserializeToMirror(HyperDB::GetDatabase(file_buffer_.data()));
+    file_buffer_.clear();
+    file_buffer_.shrink_to_fit();
     return;
   }
 
@@ -222,6 +233,10 @@ void HyperDBManager::OpenDB(const std::string &path,
   std::memcpy(salt, data.data(), 16);
   std::memcpy(iv, data.data() + 16, 16);
   std::memcpy(&its, data.data() + 32, 4);
+
+  // security floor: if stored iterations < 10000, someone tampered with the file
+  // or we're loading an old file. use minimum acceptable value.
+  if (its < 10000) its = 10000; 
 
   uint8_t key[32];
   PKCS5_PBKDF2_HMAC(const_cast<uint8_t *>(
@@ -242,6 +257,8 @@ void HyperDBManager::OpenDB(const std::string &path,
     throw std::runtime_error("HyperDB: wrong password or corrupt file.");
 
   DeserializeToMirror(HyperDB::GetDatabase(file_buffer_.data()));
+  file_buffer_.clear();
+  file_buffer_.shrink_to_fit();
 }
 
 void HyperDBManager::FlushDB(uint32_t iterations) {
@@ -257,11 +274,17 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
       return;
   }
 
+  // security floor: if you try to save with iterations < 10000, we override.
+  // because saving with 1 iteration is basically just giving the password away.
+  if (iterations < 10000)
+    iterations = 10000;
+
   flatbuffers::FlatBufferBuilder builder(1024 * 1024);
   {
     std::lock_guard<std::mutex> lock_d(data_mutex_);
     auto db_offset = SerializeFromMirror(builder);
     builder.Finish(db_offset, HyperDB::DatabaseIdentifier());
+    dirty_ = false; // set false while locked to prevent race with ExecWrite
   }
 
   std::ofstream file(db_path_, std::ios::binary | std::ios::trunc);
@@ -285,6 +308,11 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
     std::vector<uint8_t> cipher(plain_len);
     std::memcpy(cipher.data(), builder.GetBufferPointer(), plain_len);
 
+    // tinyAES CTR takes uint32_t for length. if we somehow exceed 4GB in a single shard,
+    // we need to chunk it or we'll overflow. given FB is 32-bit offset anyway, 
+    // a 4GB shard is already a miracle. he who breaches 4GB deserves the crash.
+    if (plain_len > 0xFFFFFFFF) throw std::runtime_error("HyperDB: shard size exceeds AES-CTR-32 limit. use more shards.");
+
     AES_ctx ctx;
     AES_init_ctx_iv(&ctx, key, iv);
     AES_CTR_xcrypt_buffer(&ctx, cipher.data(),
@@ -297,7 +325,6 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
                static_cast<std::streamsize>(plain_len));
   }
 
-  dirty_ = false;
   last_flush_time_ = std::chrono::steady_clock::now();
 }
 
@@ -354,16 +381,9 @@ void HyperDBManager::QueueWrite(const std::string &table_name,
 
 void HyperDBManager::QueueWriteBulk(const std::string &table_name,
                                     std::vector<std::vector<RowData>> rows) {
-  std::vector<QueueEntry> entries;
-  entries.reserve(rows.size());
-  for (auto &r : rows) {
-    QueueEntry e;
-    e.action = QueueActionType::Write;
-    e.table_name = table_name;
-    e.row_data = std::move(r);
-    entries.push_back(std::move(e));
-  }
-  queue_.AddToQueueBulk(std::move(entries));
+  queue_.AddToQueue(QueueEntry{.action = QueueActionType::WriteBulk,
+                               .table_name = table_name,
+                               .row_data_bulk = std::move(rows)});
 }
 void HyperDBManager::QueueRead(const std::string &table_name, uint64_t row_id,
                                std::function<void(ReadResult)> callback) {
@@ -406,25 +426,7 @@ bool HyperDBManager::IsQueueEmpty() { return queue_.IsEmpty(); }
 bool HyperDBManager::IsDirty() { return dirty_; }
 
 size_t HyperDBManager::EstimateMirrorSize() {
-  std::lock_guard<std::mutex> lock(data_mutex_);
-  size_t total = 0;
-  for (auto &table : mirror_.tables)
-    for (auto &col : table.columns) {
-      total += col.i8.size() * sizeof(int8_t);
-      total += col.i16.size() * sizeof(int16_t);
-      total += col.i32.size() * sizeof(int32_t);
-      total += col.i64.size() * sizeof(int64_t);
-      total += col.u8.size() * sizeof(uint8_t);
-      total += col.u16.size() * sizeof(uint16_t);
-      total += col.u32.size() * sizeof(uint32_t);
-      total += col.u64.size() * sizeof(uint64_t);
-      total += col.f32.size() * sizeof(float);
-      total += col.f64.size() * sizeof(double);
-      total += col.bools.size() * sizeof(uint8_t);
-      for (auto &s : col.strings)
-        total += s.size();
-    }
-  return total;
+    return estimated_size_.load();
 }
 
 // ═════════════════════════════════════════
@@ -440,9 +442,8 @@ void HyperDBManager::ExecCreateDatabase(const std::string &name) {
 void HyperDBManager::ExecCreateTable(const std::string &table_name,
                                      const std::vector<ColumnDef> &cols) {
   std::lock_guard<std::mutex> lock(data_mutex_);
-  for (auto &t : mirror_.tables)
-    if (t.name == table_name)
-      return; // already exists, touch nothing
+  if (mirror_.table_map.find(table_name) != mirror_.table_map.end())
+    return; // already exists, touch nothing
 
   TableMirror table;
   table.name = table_name;
@@ -454,7 +455,9 @@ void HyperDBManager::ExecCreateTable(const std::string &table_name,
     table.column_map[cm.name] = i;
     table.columns.push_back(std::move(cm));
   }
+  size_t idx = mirror_.tables.size();
   mirror_.tables.push_back(std::move(table));
+  mirror_.table_map[table_name] = idx;
   dirty_ = true;
   estimated_size_ += table_name.length();
   for (const auto &c : cols)
@@ -463,33 +466,28 @@ void HyperDBManager::ExecCreateTable(const std::string &table_name,
 
 void HyperDBManager::ExecDropTable(const std::string &table_name) {
   std::lock_guard<std::mutex> lock(data_mutex_);
-  auto &tables = mirror_.tables;
-  auto it =
-      std::remove_if(tables.begin(), tables.end(), [&](const TableMirror &t) {
-        return t.name == table_name;
-      });
-  if (it != tables.end()) {
-    // Recalculate size reduction
-    estimated_size_ -= table_name.length();
-    for (const auto &col : it->columns) {
-      estimated_size_ -= col.name.length() + 8; // overhead
-      estimated_size_ -= col.i8.size() * sizeof(int8_t);
-      estimated_size_ -= col.i16.size() * sizeof(int16_t);
-      estimated_size_ -= col.i32.size() * sizeof(int32_t);
-      estimated_size_ -= col.i64.size() * sizeof(int64_t);
-      estimated_size_ -= col.u8.size() * sizeof(uint8_t);
-      estimated_size_ -= col.u16.size() * sizeof(uint16_t);
-      estimated_size_ -= col.u32.size() * sizeof(uint32_t);
-      estimated_size_ -= col.u64.size() * sizeof(uint64_t);
-      estimated_size_ -= col.f32.size() * sizeof(float);
-      estimated_size_ -= col.f64.size() * sizeof(double);
-      estimated_size_ -= col.bools.size() * sizeof(uint8_t);
-      for (const auto &s : col.strings)
-        estimated_size_ -= s.size();
-    }
-    tables.erase(it, tables.end());
-    dirty_ = true;
+  auto it = mirror_.table_map.find(table_name);
+  if (it == mirror_.table_map.end())
+    return;
+  
+  size_t idx = it->second;
+  // Recalculate size reduction - subtract overhead only
+  estimated_size_ -= table_name.length();
+  for (const auto &col : mirror_.tables[idx].columns) {
+    estimated_size_ -= col.name.length() + 8; // overhead
+    // Note: actual data memory freed by vector destructor
   }
+  
+  // Erase table and update map
+  mirror_.tables.erase(mirror_.tables.begin() + idx);
+  mirror_.table_map.erase(it);
+  
+  // Update indices for tables after the erased one
+  for (size_t i = idx; i < mirror_.tables.size(); ++i) {
+    mirror_.table_map[mirror_.tables[i].name] = i;
+  }
+  
+  dirty_ = true;
 }
 
 void HyperDBManager::ExecClearTable(const std::string &table_name) {
@@ -513,6 +511,8 @@ void HyperDBManager::ExecClearTable(const std::string &table_name) {
     estimated_size_ -= col.bools.size() * sizeof(uint8_t);
     for (const auto &s : col.strings)
       estimated_size_ -= s.size();
+    for (const auto &b : col.bytes)
+      estimated_size_ -= b.size();
     col = ColumnMirror{col.name, col.type}; // Clear data
   }
   table->row_count = 0;
@@ -543,6 +543,8 @@ void HyperDBManager::ExecClearColumn(const std::string &table_name,
   estimated_size_ -= col->bools.size() * sizeof(uint8_t);
   for (const auto &s : col->strings)
     estimated_size_ -= s.size();
+  for (const auto &b : col->bytes)
+    estimated_size_ -= b.size();
 
   // clear all the things. yes all of them. no, you can't just clear one.
   col->i8.clear();
@@ -557,6 +559,7 @@ void HyperDBManager::ExecClearColumn(const std::string &table_name,
   col->f64.clear();
   col->bools.clear();
   col->strings.clear();
+  col->bytes.clear();
   dirty_ = true;
 }
 
@@ -625,11 +628,236 @@ void HyperDBManager::ExecWrite(const std::string &table_name,
       col->strings.push_back(std::move(s));
       break;
     }
-    default:
+    case HyperDB::ColumnType::ColumnType_Bytes: {
+      if (std::holds_alternative<std::vector<uint8_t>>(rd.value)) {
+        const auto &b = std::get<std::vector<uint8_t>>(rd.value);
+        estimated_size_ += b.size();
+        col->bytes.push_back(b);
+      } else {
+        // someone's writing strings into bytes. degenerate behavior.
+        col->bytes.push_back({});
+      }
       break;
     }
+    }
   }
+
+  // padding loop: if a column wasn't in the write, give it a default value.
+  // if you forget this, row_count drifts and the DB becomes a digital graveyard.
+  for (auto &col : table->columns) {
+    size_t target_len = table->row_count + 1;
+    size_t current_len = 0;
+    switch (col.type) {
+      case HyperDB::ColumnType::ColumnType_Int8: current_len = col.i8.size(); break;
+      case HyperDB::ColumnType::ColumnType_Int16: current_len = col.i16.size(); break;
+      case HyperDB::ColumnType::ColumnType_Int32: current_len = col.i32.size(); break;
+      case HyperDB::ColumnType::ColumnType_Int64: current_len = col.i64.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt8: current_len = col.u8.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt16: current_len = col.u16.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt32: current_len = col.u32.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt64: current_len = col.u64.size(); break;
+      case HyperDB::ColumnType::ColumnType_Float32: current_len = col.f32.size(); break;
+      case HyperDB::ColumnType::ColumnType_Float64: current_len = col.f64.size(); break;
+      case HyperDB::ColumnType::ColumnType_Bool: current_len = col.bools.size(); break;
+      case HyperDB::ColumnType::ColumnType_String: current_len = col.strings.size(); break;
+      case HyperDB::ColumnType::ColumnType_Bytes: current_len = col.bytes.size(); break;
+      default: break;
+    }
+
+    if (current_len < target_len) {
+      auto def = GetDefaultValue(col.type);
+      size_t diff = target_len - current_len;
+      switch (col.type) {
+      case HyperDB::ColumnType::ColumnType_Int8:
+        col.i8.resize(target_len, std::get<int8_t>(def));
+        estimated_size_ += diff * sizeof(int8_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Int16:
+        col.i16.resize(target_len, std::get<int16_t>(def));
+        estimated_size_ += diff * sizeof(int16_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Int32:
+        col.i32.resize(target_len, std::get<int32_t>(def));
+        estimated_size_ += diff * sizeof(int32_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Int64:
+        col.i64.resize(target_len, std::get<int64_t>(def));
+        estimated_size_ += diff * sizeof(int64_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt8:
+        col.u8.resize(target_len, std::get<uint8_t>(def));
+        estimated_size_ += diff * sizeof(uint8_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt16:
+        col.u16.resize(target_len, std::get<uint16_t>(def));
+        estimated_size_ += diff * sizeof(uint16_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt32:
+        col.u32.resize(target_len, std::get<uint32_t>(def));
+        estimated_size_ += diff * sizeof(uint32_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt64:
+        col.u64.resize(target_len, std::get<uint64_t>(def));
+        estimated_size_ += diff * sizeof(uint64_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Float32:
+        col.f32.resize(target_len, std::get<float>(def));
+        estimated_size_ += diff * sizeof(float);
+        break;
+      case HyperDB::ColumnType::ColumnType_Float64:
+        col.f64.resize(target_len, std::get<double>(def));
+        estimated_size_ += diff * sizeof(double);
+        break;
+      case HyperDB::ColumnType::ColumnType_Bool:
+        col.bools.resize(target_len, std::get<bool>(def) ? 1 : 0);
+        estimated_size_ += diff * sizeof(uint8_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_String:
+        col.strings.resize(target_len, std::get<std::string>(def));
+        break;
+      case HyperDB::ColumnType::ColumnType_Bytes:
+        col.bytes.resize(target_len, std::get<std::vector<uint8_t>>(def));
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
   table->row_count++;
+  dirty_ = true;
+}
+
+void HyperDBManager::ExecWriteBulk(const std::string &table_name,
+                                   const std::vector<std::vector<RowData>> &rows) {
+  if (rows.empty())
+    return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  TableMirror *table = FindTable(table_name);
+  if (!table)
+    return;
+
+  size_t size_accum = 0;
+  for (const auto &row : rows) {
+    for (const auto &rd : row) {
+      auto it = table->column_map.find(rd.column_name);
+      if (it == table->column_map.end())
+        continue;
+
+      ColumnMirror *col = &table->columns[it->second];
+      switch (col->type) {
+      case HyperDB::ColumnType::ColumnType_Int8:
+        col->i8.push_back(static_cast<int8_t>(CoerceI64(rd.value)));
+        size_accum += sizeof(int8_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Int16:
+        col->i16.push_back(static_cast<int16_t>(CoerceI64(rd.value)));
+        size_accum += sizeof(int16_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Int32:
+        col->i32.push_back(static_cast<int32_t>(CoerceI64(rd.value)));
+        size_accum += sizeof(int32_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Int64:
+        col->i64.push_back(static_cast<int64_t>(CoerceI64(rd.value)));
+        size_accum += sizeof(int64_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt8:
+        col->u8.push_back(static_cast<uint8_t>(CoerceU64(rd.value)));
+        size_accum += sizeof(uint8_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt16:
+        col->u16.push_back(static_cast<uint16_t>(CoerceU64(rd.value)));
+        size_accum += sizeof(uint16_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt32:
+        col->u32.push_back(static_cast<uint32_t>(CoerceU64(rd.value)));
+        size_accum += sizeof(uint32_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_UInt64:
+        col->u64.push_back(static_cast<uint64_t>(CoerceU64(rd.value)));
+        size_accum += sizeof(uint64_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_Float32:
+        col->f32.push_back(static_cast<float>(CoerceF64(rd.value)));
+        size_accum += sizeof(float);
+        break;
+      case HyperDB::ColumnType::ColumnType_Float64:
+        col->f64.push_back(static_cast<double>(CoerceF64(rd.value)));
+        size_accum += sizeof(double);
+        break;
+      case HyperDB::ColumnType::ColumnType_Bool:
+        col->bools.push_back(CoerceI64(rd.value) ? 1 : 0);
+        size_accum += sizeof(uint8_t);
+        break;
+      case HyperDB::ColumnType::ColumnType_String: {
+        if (std::holds_alternative<std::string>(rd.value)) {
+            const auto &s = std::get<std::string>(rd.value);
+            size_accum += s.size();
+            col->strings.push_back(s);
+        } else {
+            col->strings.push_back("");
+        }
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Bytes: {
+        if (std::holds_alternative<std::vector<uint8_t>>(rd.value)) {
+            const auto &b = std::get<std::vector<uint8_t>>(rd.value);
+            size_accum += b.size();
+            col->bytes.push_back(b);
+        } else {
+            col->bytes.push_back({});
+        }
+        break;
+      }
+      }
+    }
+
+    // padding loop for bulk
+    for (auto &col : table->columns) {
+      size_t target_len = table->row_count + 1;
+      size_t current_len = 0;
+      switch (col.type) {
+      case HyperDB::ColumnType::ColumnType_Int8: current_len = col.i8.size(); break;
+      case HyperDB::ColumnType::ColumnType_Int16: current_len = col.i16.size(); break;
+      case HyperDB::ColumnType::ColumnType_Int32: current_len = col.i32.size(); break;
+      case HyperDB::ColumnType::ColumnType_Int64: current_len = col.i64.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt8: current_len = col.u8.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt16: current_len = col.u16.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt32: current_len = col.u32.size(); break;
+      case HyperDB::ColumnType::ColumnType_UInt64: current_len = col.u64.size(); break;
+      case HyperDB::ColumnType::ColumnType_Float32: current_len = col.f32.size(); break;
+      case HyperDB::ColumnType::ColumnType_Float64: current_len = col.f64.size(); break;
+      case HyperDB::ColumnType::ColumnType_Bool: current_len = col.bools.size(); break;
+      case HyperDB::ColumnType::ColumnType_String: current_len = col.strings.size(); break;
+      case HyperDB::ColumnType::ColumnType_Bytes: current_len = col.bytes.size(); break;
+      default: break;
+      }
+
+      if (current_len < target_len) {
+        auto def = GetDefaultValue(col.type);
+        size_t diff = target_len - current_len;
+        switch (col.type) {
+          case HyperDB::ColumnType::ColumnType_Int8: col.i8.resize(target_len, std::get<int8_t>(def)); size_accum += diff * sizeof(int8_t); break;
+          case HyperDB::ColumnType::ColumnType_Int16: col.i16.resize(target_len, std::get<int16_t>(def)); size_accum += diff * sizeof(int16_t); break;
+          case HyperDB::ColumnType::ColumnType_Int32: col.i32.resize(target_len, std::get<int32_t>(def)); size_accum += diff * sizeof(int32_t); break;
+          case HyperDB::ColumnType::ColumnType_Int64: col.i64.resize(target_len, std::get<int64_t>(def)); size_accum += diff * sizeof(int64_t); break;
+          case HyperDB::ColumnType::ColumnType_UInt8: col.u8.resize(target_len, std::get<uint8_t>(def)); size_accum += diff * sizeof(uint8_t); break;
+          case HyperDB::ColumnType::ColumnType_UInt16: col.u16.resize(target_len, std::get<uint16_t>(def)); size_accum += diff * sizeof(uint16_t); break;
+          case HyperDB::ColumnType::ColumnType_UInt32: col.u32.resize(target_len, std::get<uint32_t>(def)); size_accum += diff * sizeof(uint32_t); break;
+          case HyperDB::ColumnType::ColumnType_UInt64: col.u64.resize(target_len, std::get<uint64_t>(def)); size_accum += diff * sizeof(uint64_t); break;
+          case HyperDB::ColumnType::ColumnType_Float32: col.f32.resize(target_len, std::get<float>(def)); size_accum += diff * sizeof(float); break;
+          case HyperDB::ColumnType::ColumnType_Float64: col.f64.resize(target_len, std::get<double>(def)); size_accum += diff * sizeof(double); break;
+          case HyperDB::ColumnType::ColumnType_Bool: col.bools.resize(target_len, std::get<bool>(def) ? 1 : 0); size_accum += diff * sizeof(uint8_t); break;
+          case HyperDB::ColumnType::ColumnType_String: col.strings.resize(target_len, std::get<std::string>(def)); break;
+          case HyperDB::ColumnType::ColumnType_Bytes: col.bytes.resize(target_len, std::get<std::vector<uint8_t>>(def)); break;
+          default: break;
+        }
+      }
+    }
+    table->row_count++;
+  }
+  estimated_size_ += size_accum;
   dirty_ = true;
 }
 
@@ -782,6 +1010,15 @@ void HyperDBManager::ExecFind(
           hits.push_back(i);
       break;
     }
+    case HyperDB::ColumnType::ColumnType_Bytes: {
+      if (std::holds_alternative<std::vector<uint8_t>>(val)) {
+          auto& n = std::get<std::vector<uint8_t>>(val);
+          for (uint64_t i = 0; i < table->row_count; ++i)
+            if (col->bytes[i] == n)
+              hits.push_back(i);
+      }
+      break;
+    }
     default:
       break;
     }
@@ -908,6 +1145,15 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
         to_delete.push_back(i);
     break;
   }
+  case HyperDB::ColumnType::ColumnType_Bytes: {
+    if (std::holds_alternative<std::vector<uint8_t>>(val)) {
+        auto& n = std::get<std::vector<uint8_t>>(val);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->bytes[i] == n)
+            to_delete.push_back(i);
+    }
+    break;
+  }
   default:
     break;
   }
@@ -974,6 +1220,10 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
         estimated_size_ -= c.strings[idx].length();
         c.strings.erase(c.strings.begin() + idx);
         break;
+      case HyperDB::ColumnType::ColumnType_Bytes:
+        estimated_size_ -= c.bytes[idx].size();
+        c.bytes.erase(c.bytes.begin() + idx);
+        break;
       default:
         break;
       }
@@ -990,9 +1240,9 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
 // ═════════════════════════════════════════
 
 TableMirror *HyperDBManager::FindTable(const std::string &name) {
-  for (auto &t : mirror_.tables)
-    if (t.name == name)
-      return &t;
+  auto it = mirror_.table_map.find(name);
+  if (it != mirror_.table_map.end() && it->second < mirror_.tables.size())
+    return &mirror_.tables[it->second];
   return nullptr;
 }
 
@@ -1032,11 +1282,32 @@ HyperValue HyperDBManager::GetValueAtIndex(const ColumnMirror &col,
   case HyperDB::ColumnType::ColumnType_Bool:
     return static_cast<bool>(col.bools.at(idx));
   case HyperDB::ColumnType::ColumnType_String:
-    return col.strings.at(idx);
+    return idx < col.strings.size() ? col.strings[idx] : "";
+  case HyperDB::ColumnType::ColumnType_Bytes:
+    return idx < col.bytes.size() ? col.bytes[idx] : std::vector<uint8_t>{};
   default:
     return int8_t(0); // if we reach here, the schema changed and i have no idea
                       // what's going on
   }
+}
+
+HyperValue HyperDBManager::GetDefaultValue(HyperDB::ColumnType type) {
+    switch (type) {
+    case HyperDB::ColumnType::ColumnType_Int8: return int8_t(0);
+    case HyperDB::ColumnType::ColumnType_Int16: return int16_t(0);
+    case HyperDB::ColumnType::ColumnType_Int32: return int32_t(0);
+    case HyperDB::ColumnType::ColumnType_Int64: return int64_t(0);
+    case HyperDB::ColumnType::ColumnType_UInt8: return uint8_t(0);
+    case HyperDB::ColumnType::ColumnType_UInt16: return uint16_t(0);
+    case HyperDB::ColumnType::ColumnType_UInt32: return uint32_t(0);
+    case HyperDB::ColumnType::ColumnType_UInt64: return uint64_t(0);
+    case HyperDB::ColumnType::ColumnType_Float32: return 0.0f;
+    case HyperDB::ColumnType::ColumnType_Float64: return 0.0;
+    case HyperDB::ColumnType::ColumnType_Bool: return false;
+    case HyperDB::ColumnType::ColumnType_String: return std::string("");
+    case HyperDB::ColumnType::ColumnType_Bytes: return std::vector<uint8_t>{};
+    default: return int8_t(0);
+    }
 }
 
 // ─────────────────────────────────────────
@@ -1155,6 +1426,16 @@ HyperDBManager::SerializeFromMirror(flatbuffers::FlatBufferBuilder &builder) {
             HyperDB::ColumnData::ColumnData_StringColumn, t.Union());
         break;
       }
+      case HyperDB::ColumnType::ColumnType_Bytes: {
+        std::vector<flatbuffers::Offset<flatbuffers::String>> vec;
+        for (auto &b : cm.bytes)
+          vec.push_back(builder.CreateString(reinterpret_cast<const char*>(b.data()), b.size()));
+        auto t = HyperDB::CreateBytesColumn(builder, builder.CreateVector(vec));
+        col_offset = HyperDB::CreateColumn(
+            builder, name_off, cm.type,
+            HyperDB::ColumnData::ColumnData_BytesColumn, t.Union());
+        break;
+      }
       default:
         break;
       }
@@ -1270,6 +1551,15 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database *db) {
             }
           }
           break;
+        case HyperDB::ColumnType::ColumnType_Bytes:
+          if (auto *c = col->data_as_BytesColumn()) {
+            for (auto *s : *c->values()) {
+              std::vector<uint8_t> b(s->begin(), s->end());
+              cm.bytes.push_back(b);
+              estimated_size_ += b.size();
+            }
+          }
+          break;
         default:
           break;
         }
@@ -1281,6 +1571,10 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database *db) {
       }
     }
     mirror_.tables.push_back(std::move(tm));
+  }
+  // rebuild table_map for O(1) lookups
+  for (size_t i = 0; i < mirror_.tables.size(); ++i) {
+    mirror_.table_map[mirror_.tables[i].name] = i;
   }
   // we already accumulated the size in 'estimated_size_' during the loops.
   // do not call the locked EstimateMirrorSize() here or we'll deadlock our own
@@ -1328,9 +1622,10 @@ void HyperDBCluster::Open(const std::string &folder, const std::string &name,
 }
 
 void HyperDBCluster::Flush(uint32_t iterations) {
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
   for (auto &shard : shards_)
     shard->FlushDB(iterations);
-  SaveManifest();
+  SaveManifestInternal();
 }
 
 void HyperDBCluster::SetFlushInterval(int64_t ms) {
@@ -1339,9 +1634,10 @@ void HyperDBCluster::SetFlushInterval(int64_t ms) {
 }
 
 void HyperDBCluster::ForceFlush(uint32_t iterations) {
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
   for (auto &shard : shards_)
     shard->ForceFlush(iterations);
-  SaveManifest();
+  SaveManifestInternal();
 }
 
 void HyperDBCluster::SetEncryption(bool encrypt, const std::string &password) {
@@ -1351,7 +1647,7 @@ void HyperDBCluster::SetEncryption(bool encrypt, const std::string &password) {
   for (auto &shard : shards_) {
     shard->SetEncryption(encrypt, password);
   }
-  SaveManifest();
+  SaveManifestInternal();
 }
 
 bool HyperDBCluster::IsQueueEmpty() {
@@ -1363,6 +1659,7 @@ bool HyperDBCluster::IsQueueEmpty() {
 
 void HyperDBCluster::QueueCreateTable(const std::string &table_name,
                                       std::vector<ColumnDef> cols) {
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
   cluster_schemas_[table_name] = cols;
   for (auto &shard : shards_)
     shard->QueueCreateTable(table_name, cols);
@@ -1374,8 +1671,28 @@ void HyperDBCluster::QueueDropTable(const std::string &table_name,
                                     ShardTarget target) {
   ForEachShard(
       target, [&](HyperDBManager &shard) { shard.QueueDropTable(table_name); });
-  if (target == ShardTarget::All)
+
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
+  if (target == ShardTarget::All) {
     manifest_tables_.erase(table_name);
+  } else {
+    // partial drop: find exactly which shards we hit and scrub them from manifest
+    std::vector<int> indices = GetShardIndicesInternal(target);
+    auto it = manifest_tables_.find(table_name);
+    if (it != manifest_tables_.end()) {
+      auto &entries = it->second;
+      for (int idx : indices) {
+        entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                     [idx](const ShardTableEntry &e) {
+                                       return e.shard_index == idx;
+                                     }),
+                      entries.end());
+      }
+      if (entries.empty())
+        manifest_tables_.erase(it);
+    }
+  }
+  SaveManifestInternal();
 }
 
 void HyperDBCluster::QueueClearTable(const std::string &table_name,
@@ -1398,7 +1715,8 @@ void HyperDBCluster::QueueClearColumn(const std::string &table_name,
 void HyperDBCluster::QueueWrite(const std::string &table_name,
                                 std::vector<RowData> row) {
   MaybeSpillToNewShard();
-  uint64_t global_row_id = NextGlobalRowId(table_name);
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
+  uint64_t global_row_id = NextGlobalRowIdInternal(table_name);
   ActiveShard().QueueWrite(table_name, std::move(row));
 
   auto &entries = manifest_tables_[table_name];
@@ -1414,9 +1732,8 @@ void HyperDBCluster::QueueWriteBulk(const std::string &table_name,
     return;
   MaybeSpillToNewShard();
 
-  // check if the batch is MASSIVE. if so, we split it.
-  // idc - dev. just push it to the active shard.
-  uint64_t global_start = NextGlobalRowId(table_name);
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
+  uint64_t global_start = NextGlobalRowIdInternal(table_name);
   uint64_t global_end = global_start + rows.size() - 1;
 
   ActiveShard().QueueWriteBulk(table_name, std::move(rows));
@@ -1431,20 +1748,29 @@ void HyperDBCluster::QueueWriteBulk(const std::string &table_name,
 void HyperDBCluster::QueueRead(const std::string &table_name,
                                uint64_t global_row_id,
                                std::function<void(ReadResult)> callback) {
-  auto [shard_idx, local_row] = ResolveRowId(table_name, global_row_id);
-  if (shard_idx < 0) {
+  std::pair<int, uint64_t> resolved;
+  {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    resolved = ResolveRowIdInternal(table_name, global_row_id);
+  }
+  
+  if (resolved.first < 0) {
     if (callback)
       callback({});
     return;
   }
-  shards_[shard_idx]->QueueRead(table_name, local_row, std::move(callback));
+  shards_[resolved.first]->QueueRead(table_name, resolved.second, std::move(callback));
 }
 
 void HyperDBCluster::QueueFind(
     const std::string &table_name, const std::string &column_name,
     HyperValue value, std::function<void(std::vector<ReadResult>)> callback,
     ShardTarget target) {
-  std::vector<int> indices = GetShardIndices(target);
+  std::vector<int> indices;
+  {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    indices = GetShardIndicesInternal(target);
+  }
   if (indices.empty()) {
     if (callback)
       callback({});
@@ -1478,7 +1804,11 @@ void HyperDBCluster::QueueFind(
 void HyperDBCluster::QueueDelete(const std::string &table_name,
                                  const std::string &column_name,
                                  HyperValue value, ShardTarget target) {
-  auto indices = GetShardIndices(target);
+  std::vector<int> indices;
+  {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    indices = GetShardIndicesInternal(target);
+  }
   for (int idx : indices) {
     shards_[idx]->QueueDelete(table_name, column_name, value,
                               [this, table_name, idx](int count) {
@@ -1490,6 +1820,7 @@ void HyperDBCluster::QueueDelete(const std::string &table_name,
 
 int HyperDBCluster::GetRowCount(const std::string &table_name) {
   int total = 0;
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
   for (auto &shard : shards_) {
     int c = shard->GetRowCount(table_name);
     if (c > 0)
@@ -1517,23 +1848,27 @@ HyperDBManager &HyperDBCluster::ActiveShard() {
 }
 
 void HyperDBCluster::MaybeSpillToNewShard() {
-  if (ActiveShard().EstimateMirrorSize() < shard_limit_)
-    return;
+  {
+      std::lock_guard<std::mutex> lock(manifest_mutex_);
+      if (shards_[active_shard_index_]->EstimateMirrorSize() < shard_limit_)
+          return;
 
-  // current shard is full. flush it so it doesn't sit dirty in memory.
-  ActiveShard().FlushDB();
-  active_shard_index_++;
-  OpenShard(active_shard_index_);
+      // current shard is full. flush it so it doesn't sit dirty in memory.
+      // we can't lock data_mutex_ here but FlushDB has its own lock.
+      shards_[active_shard_index_]->FlushDB();
 
-  // teach the new shard the history of our universe.
-  // if cluster_schemas_ is empty here, you forgot to call Open(). classic.
-  for (auto &[t_name, cols] : cluster_schemas_)
-    ActiveShard().QueueCreateTable(t_name, cols);
+      active_shard_index_++;
+      OpenShard(active_shard_index_);
 
-  SaveManifest();
+      // teach the new shard the history of our universe.
+      for (auto &[t_name, cols] : cluster_schemas_)
+        shards_[active_shard_index_]->QueueCreateTable(t_name, cols);
+
+      SaveManifestInternal();
+  }
 }
 
-uint64_t HyperDBCluster::NextGlobalRowId(const std::string &table_name) {
+uint64_t HyperDBCluster::NextGlobalRowIdInternal(const std::string &table_name) {
   auto &entries = manifest_tables_[table_name];
   if (entries.empty())
     return 0;
@@ -1541,8 +1876,8 @@ uint64_t HyperDBCluster::NextGlobalRowId(const std::string &table_name) {
 }
 
 std::pair<int, uint64_t>
-HyperDBCluster::ResolveRowId(const std::string &table_name,
-                             uint64_t global_row_id) {
+HyperDBCluster::ResolveRowIdInternal(const std::string &table_name,
+                                     uint64_t global_row_id) {
   auto it = manifest_tables_.find(table_name);
   if (it == manifest_tables_.end())
     return {-1, 0};
@@ -1554,7 +1889,7 @@ HyperDBCluster::ResolveRowId(const std::string &table_name,
   return {-1, 0};
 }
 
-std::vector<int> HyperDBCluster::GetShardIndices(ShardTarget target) {
+std::vector<int> HyperDBCluster::GetShardIndicesInternal(ShardTarget target) {
   std::vector<int> indices;
   indices.reserve(shards_.size());
   for (int i = 0; i < static_cast<int>(shards_.size()); i++) {
@@ -1570,11 +1905,31 @@ std::vector<int> HyperDBCluster::GetShardIndices(ShardTarget target) {
 
 void HyperDBCluster::ForEachShard(ShardTarget target,
                                   std::function<void(HyperDBManager &)> fn) {
-  for (int idx : GetShardIndices(target))
+  std::vector<int> indices;
+  {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    indices = GetShardIndicesInternal(target);
+  }
+  for (int idx : indices)
     fn(*shards_[idx]);
 }
 
 void HyperDBCluster::SaveManifest() {
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
+  SaveManifestInternal();
+}
+
+void HyperDBCluster::SaveManifestInternal() {
+  auto now = std::chrono::steady_clock::now();
+  auto ms_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - last_manifest_save_).count();
+  
+  // Always save if enough time has passed, otherwise just mark dirty
+  if (ms_since_last < MANIFEST_SAVE_INTERVAL_MS) {
+    manifest_dirty_ = true;
+    return;
+  }
+  
   json j;
   j["active_shard"] = active_shard_index_;
   j["shard_count"] = static_cast<int>(shards_.size());
@@ -1594,9 +1949,25 @@ void HyperDBCluster::SaveManifest() {
 
   std::ofstream f(manifest_path_);
   f << j.dump(2);
+  
+  last_manifest_save_ = now;
+  manifest_dirty_ = false;
+}
+
+void HyperDBCluster::MaybeSaveManifest() {
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
+  if (manifest_dirty_) {
+    auto now = std::chrono::steady_clock::now();
+    auto ms_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_manifest_save_).count();
+    if (ms_since_last >= MANIFEST_SAVE_INTERVAL_MS) {
+      SaveManifestInternal();
+    }
+  }
 }
 
 void HyperDBCluster::LoadManifest() {
+  std::lock_guard<std::mutex> lock(manifest_mutex_);
   std::ifstream f(manifest_path_);
   if (!f.is_open())
     throw std::runtime_error("HyperDBCluster: failed to open manifest " +
@@ -1642,5 +2013,5 @@ void HyperDBCluster::ShiftManifestEntries(const std::string &table_name,
     }
   }
   if (found)
-    SaveManifest();
+    SaveManifestInternal();
 }

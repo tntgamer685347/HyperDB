@@ -29,9 +29,9 @@ PYBIND11_MODULE(HyperDB, m) {
         .value("UInt64", HyperDB::ColumnType_UInt64)
         .value("Float32", HyperDB::ColumnType_Float32)
         .value("Float64", HyperDB::ColumnType_Float64)
-        .value("Bool", HyperDB::ColumnType_Bool)
-        .value("String", HyperDB::ColumnType_String)
-        .value("Bytes", HyperDB::ColumnType_Bytes)
+        .value("Bool", HyperDB::ColumnType::ColumnType_Bool)
+        .value("String", HyperDB::ColumnType::ColumnType_String)
+        .value("Bytes", HyperDB::ColumnType::ColumnType_Bytes)
         .export_values();
 
     py::enum_<ShardTarget>(m, "ShardTarget", "which shards to hit. usually 'All' unless you're feeling adventurous")
@@ -52,7 +52,10 @@ PYBIND11_MODULE(HyperDB, m) {
     py::class_<RowData>(m, "RowData", "a single piece of data for a column. it's just a name and a value")
         .def(py::init<std::string, HyperValue>())
         .def_readwrite("column_name", &RowData::column_name)
-        .def_readwrite("value", &RowData::value, "the actual data. can be int, float, string, or bool. good luck");
+        .def_readwrite("value", &RowData::value);
+
+    // ensure pybind11 can handle the variant with vector<uint8_t>
+    // pybind automatically maps bytes -> vector<uint8_t> if we're careful.
 
     // -----------------------------------------------------------------------
     // HyperDBManager - the core of the chaos

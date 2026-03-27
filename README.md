@@ -44,7 +44,7 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 
 ## 🚀 Performance Benchmarks
 
-*(C++ benchmarks on AMD Ryzen 7 5800X | SQLite3 comparison on Intel i5-8400 2.8GHz bare metal Proxmox host)*
+*(C++ benchmarks on AMD Ryzen 7 5800X)*
 
 ### Solo Operations
 
@@ -74,23 +74,6 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 Once data is in memory, encrypted and unencrypted are the same speed. The ~77 second cold open gap is entirely AES-256-CTR decrypting 4.2GB of ciphertext. In-memory operations don't care about encryption mode. They never did.
 
 ---
-
-## 🆚 HyperDB vs. SQLite3
-*(10,000,000 rows — 3× 128-byte binary columns)*
-
-| | HyperDB Nitro (Ryzen 5800X) | HyperDB Encrypted (Ryzen 5800X) | SQLite3 "optimized" (i5-8400 bare metal) |
-| :--- | :--- | :--- | :--- |
-| **10M row write** | `32.1 sec` | `109.9 sec` | `~92 sec`* |
-| **Durability** | Flush-based | Flush-based | Per-commit |
-| **Cold open 4.2GB** | `7.8 sec` | `85 sec` | N/A |
-| **Full dataset scan** | `8.5 ms` | `9.0 ms` | N/A |
-
-*SQLite3 tested with `PRAGMA synchronous = OFF` and `PRAGMA journal_mode = MEMORY` — durability fully disabled to match HyperDB's non-ACID model. Total observed runtime was 257s for 20M rows; 72 seconds was pre-generation of random data leaving ~185s of actual write time (~92s equivalent for 10M rows). HyperDB generated data concurrently during writes.*
-
-The i5-8400 is a real Coffee Lake chip — solid IPC, AES-NI, proper hardware. This isn't a VM artifact. SQLite with durability off vs. HyperDB Nitro Mode — same guarantees (none), and HyperDB is still **~3x faster** on comparable hardware. The B-tree is the bottleneck. No pragma fixes the B-tree.
-
-> [!WARNING]
-> HyperDB is **not ACID compliant**. A crash between writes and a flush loses everything since the last flush. SQLite with default settings does not have this problem. Choose your tradeoff before you need to.
 
 ---
 
