@@ -14,12 +14,12 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# ---------------------------------------------------------------------------
-# Executable
-# ---------------------------------------------------------------------------
 add_executable(HyperDB-Test
     HyperDB-Test/main.cpp
 )
+
+# stay consistent with the rest of the dumpster fire.
+set_target_properties(HyperDB-Test PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
 # Include directories
