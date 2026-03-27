@@ -111,6 +111,7 @@ enum class QueueActionType : uint8_t {
     ClearColumn,
     ClearTable,
     Write,
+    WriteBulk,
     Read,
     Find,
     Delete
@@ -124,6 +125,7 @@ struct QueueEntry {
     std::string column_name;
     std::vector<ColumnDef> column_defs;
     std::vector<RowData> row_data;
+    std::vector<std::vector<RowData>> row_data_bulk;
 
     uint64_t row_id = 0;
     HyperValue value = int8_t(0);
@@ -164,6 +166,7 @@ struct TableMirror {
 struct DatabaseMirror {
     std::string name;
     std::vector<TableMirror> tables;
+    std::unordered_map<std::string, size_t> table_map;
     uint32_t version = 1;
 };
 
@@ -250,6 +253,8 @@ public:
         const std::string& column_name);
     void ExecWrite(const std::string& table_name,
         const std::vector<RowData>& row);
+    void ExecWriteBulk(const std::string& table_name,
+        const std::vector<std::vector<RowData>>& rows);
     void ExecRead(const std::string& table_name, uint64_t row_id,
         const std::function<void(ReadResult)>& callback);
     void ExecFind(const std::string& table_name, const std::string& col_name,
@@ -357,6 +362,7 @@ private:
     void SaveManifest();
     void LoadManifest();
     void SaveManifestInternal();
+    void MaybeSaveManifest(); // Throttled manifest save
     std::vector<int> GetShardIndicesInternal(ShardTarget target);
     void ShiftManifestEntries(const std::string& table_name, int from_shard_index,
         int delta);
@@ -374,4 +380,10 @@ private:
         manifest_tables_;
     std::unordered_map<std::string, std::vector<ColumnDef>> cluster_schemas_;
     std::mutex manifest_mutex_;
+
+    // Manifest throttling - prevents excessive disk writes
+    bool manifest_dirty_ = false;
+    std::chrono::steady_clock::time_point last_manifest_save_ =
+        std::chrono::steady_clock::now();
+    static constexpr int64_t MANIFEST_SAVE_INTERVAL_MS = 1000; // Max 1 save per second
 };
