@@ -8,6 +8,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# statically link the msvc runtime so you can run it on a fresh vm
+# without downloading a 50mb redistributable because life is pain.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
@@ -24,12 +30,17 @@ target_include_directories(HyperDB-Test PRIVATE
 
 # ---------------------------------------------------------------------------
 # Link against the pre-built HyperDB static library
-# On Linux  → libHyperDB.a  (placed at HyperDB-Test/include/lib/libHyperDB.a)
-# On Windows → HyperDB.lib  (placed at HyperDB-Test/include/lib/HyperDB.lib)
+# i'm choosing to link against the .a or .lib manually. don't ask why.
 # ---------------------------------------------------------------------------
-target_link_libraries(HyperDB-Test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Test/include/lib/libHyperDB.a
-)
+if(MSVC)
+    target_link_libraries(HyperDB-Test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Test/include/lib/HyperDB.lib
+    )
+else()
+    target_link_libraries(HyperDB-Test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Test/include/lib/libHyperDB.a
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # Python 3 – required because libHyperDB.a was built with pybind11
@@ -49,8 +60,18 @@ target_compile_definitions(HyperDB-Test PRIVATE
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
-target_compile_options(HyperDB-Test PRIVATE
-    -Wall -Wextra -Wno-unused-parameter
-    $<$<CONFIG:Release>:-O2>
-    $<$<CONFIG:Debug>:-O0 -g>
-)
+if(MSVC)
+    # i've spent too much time here already. just work already.
+    target_compile_options(HyperDB-Test PRIVATE 
+        /W3 /WX- /MP
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Debug>:/Od /Zi>
+    )
+else()
+    # gcc flags for people with better things to do.
+    target_compile_options(HyperDB-Test PRIVATE
+        -Wall -Wextra -Wno-unused-parameter
+        $<$<CONFIG:Release>:-O2>
+        $<$<CONFIG:Debug>:-O0 -g>
+    )
+endif()

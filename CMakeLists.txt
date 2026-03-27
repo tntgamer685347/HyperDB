@@ -8,6 +8,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# force multicore build on msvc because life is too short to wait for cl.exe
+# and statically link the runtime because dll hell is real.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ---------------------------------------------------------------------------
 # Source files  (paths are relative to this CMakeLists.txt, mirroring the
 # vcxproj which lives one directory deeper at HyperDB/HyperDB.vcxproj)
@@ -19,10 +25,11 @@ set(HYPERDB_SOURCES
     HyperDB/include/tinyAES/aes.c          # compiled as C
 )
 
-# ---------------------------------------------------------------------------
-# Static library target
-# ---------------------------------------------------------------------------
 add_library(HyperDB STATIC ${HYPERDB_SOURCES})
+
+# ensure -fPIC on linux so we can link this into a shared python module.
+# without this, it's just a 0kb paperweight on linux.
+set_target_properties(HyperDB PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
 # Include directories
@@ -51,16 +58,24 @@ target_compile_definitions(HyperDB PRIVATE
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
-target_compile_options(HyperDB PRIVATE
-    # Warnings (roughly equivalent to /W3)
-    -Wall -Wextra -Wno-unused-parameter
-
-    # Release: optimise (mirrors /O2 + /Oi + /GL)
-    $<$<CONFIG:Release>:-O2>
-
-    # Debug: no optimisation, keep debug info
-    $<$<CONFIG:Debug>:-O0 -g>
-)
+if(MSVC)
+    # msvc is a picky child and doesn't like -Wall -Wextra. 
+    # why did i choose c++ again? anyway, here's some msvc spice.
+    target_compile_options(HyperDB PRIVATE 
+        /W3 /WX- /MP
+        $<$<CONFIG:Release>:/O2 /Oi /GL>
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+    )
+    # i hope this works. if it doesn't, it's probably microsoft's fault.
+else()
+    # gcc or clang, at least they understand simple flags. usually.
+    target_compile_options(HyperDB PRIVATE
+        -Wall -Wextra -Wno-unused-parameter
+        $<$<CONFIG:Release>:-O2>
+        $<$<CONFIG:Debug>:-O0 -g>
+    )
+    # if you're reading this on linux, i envy you.
+endif()
 
 # ---------------------------------------------------------------------------
 # Linker flags
