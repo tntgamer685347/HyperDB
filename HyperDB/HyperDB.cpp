@@ -1122,7 +1122,7 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
   case HyperDB::ColumnType::ColumnType_Float32: {
     auto n = static_cast<float>(needle_f64);
     for (uint64_t i = 0; i < table->row_count; ++i)
-      if (std::fabsf(col->f32[i] - n) < 1e-6f)
+      if (std::fabs(col->f32[i] - n) < 1e-6f)
         to_delete.push_back(i);
     break;
   }

@@ -35,7 +35,8 @@ endif()
 # Include directories
 # ---------------------------------------------------------------------------
 target_include_directories(HyperDB PRIVATE
-    HyperDB-Python/include          # HyperDB.h, hyperdb_generated.h, flatbuffers/
+    HyperDB-Python            # Parent of include/ so "include/pybind11" resolves
+    HyperDB-Python/include    # HyperDB.h, hyperdb_generated.h, flatbuffers/
     HyperDB-Python/include/python3  # datetime.h (for msvc linter compatibility)
 )
 
