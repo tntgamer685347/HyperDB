@@ -41,9 +41,17 @@
 // C4505: 'PySlice_GetIndicesEx': unreferenced local function has been removed
 #endif
 
-#include <python3/Python.h>
-#include <python3/frameobject.h>
-#include <python3/pythread.h>
+// Bundled python3/* tree under HyperDB*/include is MSVC-oriented (see pyconfig.h);
+// on POSIX hosts use the interpreter's headers from Python3_INCLUDE_DIRS.
+#if defined(_WIN32)
+#    include <python3/Python.h>
+#    include <python3/frameobject.h>
+#    include <python3/pythread.h>
+#else
+#    include <Python.h>
+#    include <frameobject.h>
+#    include <pythread.h>
+#endif
 
 #if defined(_MSC_VER)
 #    pragma warning(pop)

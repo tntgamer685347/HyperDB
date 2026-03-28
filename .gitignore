@@ -84,6 +84,7 @@ StyleCopReport.xml
 *_i.c
 *_p.c
 *_h.h
+!**/wrap_include_python_h.h
 *.ilk
 *.meta
 *.obj
