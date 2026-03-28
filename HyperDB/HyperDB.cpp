@@ -987,7 +987,7 @@ void HyperDBManager::ExecFind(
       // rangeFind.
       auto n = static_cast<float>(needle_f64);
       for (uint64_t i = 0; i < table->row_count; ++i)
-        if (std::fabsf(col->f32[i] - n) < 1e-6f)
+        if (std::fabs(col->f32[i] - n) < 1e-6f)
           hits.push_back(i);
       break;
     }
