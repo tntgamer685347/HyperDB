@@ -92,22 +92,8 @@ Once data is in memory, encrypted and unencrypted are nearly identical in speed 
 
 ---
 
-## 🆚 HyperDB vs. SQLite3
-*(10,000,000 rows — 3× 128-byte binary columns)*
-
-| | HyperDB Nitro (Ryzen 5800X) | HyperDB Encrypted (Ryzen 5800X) | SQLite3 "optimized" (i5-8400 bare metal) |
-| :--- | :--- | :--- | :--- |
-| **10M row write** | `27.4 sec` | `109.9 sec` | `~92 sec`* |
-| **Durability** | Flush-based | Flush-based | Per-commit |
-| **Cold open 4.2GB** | `8.2 sec` | `85.4 sec` | N/A |
-| **Full dataset scan** | `8.6 ms` | `8.8 ms` | N/A |
-
-*SQLite3 tested with `PRAGMA synchronous = OFF` and `PRAGMA journal_mode = MEMORY` — durability fully disabled to match HyperDB's non-ACID model. Total observed runtime was 257s for 20M rows on the i5-8400; 72 seconds was pre-generation of random binary data leaving ~185s of actual write time (~92s equivalent for 10M). HyperDB generated data concurrently during writes and still finished in 27s.*
-
-The i5-8400 is real Coffee Lake silicon — AES-NI, proper IPC, not a potato. SQLite with durability disabled vs. HyperDB Nitro Mode — same guarantees (none) — and HyperDB is **~3.4x faster** on comparable hardware. No pragma fixes the B-tree.
-
 > [!WARNING]
-> HyperDB is **not ACID compliant**. A crash between writes and a flush loses everything since the last flush. SQLite with default settings does not have this problem. Choose your tradeoff before you need it.
+> HyperDB is **not ACID compliant**. A crash between writes and a flush loses everything since the last flush. Choose your tradeoff before you need it.
 
 ---
 
