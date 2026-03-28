@@ -92,22 +92,8 @@ Once data is in memory, encrypted and unencrypted are nearly identical in speed 
 
 ---
 
-## 🆚 HyperDB vs. SQLite3
-*(10,000,000 rows — 3× 128-byte binary columns)*
-
-| | HyperDB Nitro (Ryzen 5800X) | HyperDB Encrypted (Ryzen 5800X) | SQLite3 "optimized" (i5-8400 bare metal) |
-| :--- | :--- | :--- | :--- |
-| **10M row write** | `27.4 sec` | `109.9 sec` | `~92 sec`* |
-| **Durability** | Flush-based | Flush-based | Per-commit |
-| **Cold open 4.2GB** | `8.2 sec` | `85.4 sec` | N/A |
-| **Full dataset scan** | `8.6 ms` | `8.8 ms` | N/A |
-
-*SQLite3 tested with `PRAGMA synchronous = OFF` and `PRAGMA journal_mode = MEMORY` — durability fully disabled to match HyperDB's non-ACID model. Total observed runtime was 257s for 20M rows on the i5-8400; 72 seconds was pre-generation of random binary data leaving ~185s of actual write time (~92s equivalent for 10M). HyperDB generated data concurrently during writes and still finished in 27s.*
-
-The i5-8400 is real Coffee Lake silicon — AES-NI, proper IPC, not a potato. SQLite with durability disabled vs. HyperDB Nitro Mode — same guarantees (none) — and HyperDB is **~3.4x faster** on comparable hardware. No pragma fixes the B-tree.
-
 > [!WARNING]
-> HyperDB is **not ACID compliant**. A crash between writes and a flush loses everything since the last flush. SQLite with default settings does not have this problem. Choose your tradeoff before you need it.
+> HyperDB is **not ACID compliant**. A crash between writes and a flush loses everything since the last flush. Choose your tradeoff before you need it.
 
 ---
 
@@ -129,10 +115,35 @@ The i5-8400 is real Coffee Lake silicon — AES-NI, proper IPC, not a potato. SQ
 
 ## 🏗️ Installation & Setup (C++)
 
-1. Include `HyperDB.h` in your project.
-2. Link against `HyperDB.lib`.
-3. On Windows, `bcrypt.lib` is linked automatically via `#pragma comment`. If you're on Linux, `SecureRandomBytes` falls back to `std::random_device`.
-4. **CRITICAL:** Your include path must contain the `flatbuffers` headers and `hyperdb_generated.h`. The `.lib` statically links FlatBuffers but MSVC still needs the headers to compile your code. If your IDE lights up like a Christmas tree, this is why. You do **not** need `flatbuffers.lib` — it's already baked into `HyperDB.lib`.
+### Option A — Download a Release (Recommended)
+
+Grab the latest release zip from the [GitHub Releases page](../../releases/latest). Three builds are provided out of the box:
+
+| File | Platform | Compiler |
+| :--- | :--- | :--- |
+| `hyperdb-windows-msvc-vX.X.X.zip` | Windows x64 | MSVC |
+| `hyperdb-linux-gcc-vX.X.X.zip` | Linux x64 | GCC |
+| `hyperdb-linux-clang-vX.X.X.zip` | Linux x64 | Clang |
+
+Each zip contains everything you need:
+- `HyperDB.lib` / `libHyperDB.a` — static library
+- `HyperDB.pyd` / `HyperDB.so` — Python module (drop next to your script)
+- `HyperDB.h` — the only header you need to include
+- `bindings.cpp` — Python bindings source if you want to rebuild
+- `HyperDB-Test` / `HyperDB-Test.exe` — test executable to verify the build
+
+### Option B — Build from Source
+
+The CI pipeline builds with CMake across all three targets. The full workflow lives in `.github/workflows/`. Requires CMake, a C++20 compiler, and Python 3.11+ for the bindings.
+
+### Linking
+
+1. Drop `HyperDB.h` and the static lib into your project.
+2. Link against `HyperDB.lib` (Windows) or `libHyperDB.a` (Linux).
+3. On Windows, `bcrypt.lib` is pulled in automatically via `#pragma comment(lib, "bcrypt.lib")`. Nothing extra needed.
+4. On Linux, `SecureRandomBytes` falls back to `std::random_device`. No extra dependencies.
+5. **CRITICAL — Headers only, no extra libs:** `HyperDB.h` includes `flatbuffers/flatbuffers.h`, `flatbuffers/flatbuffer_builder.h`, and `hyperdb_generated.h`. You need these headers in your include path so your compiler can understand the types. The compiled FlatBuffers code is already statically linked inside `HyperDB.lib` / `libHyperDB.a` — you do **not** need `flatbuffers.lib` or `libflatbuffers.a`. Headers only.
+6. The FlatBuffers headers ship with the FlatBuffers source. `hyperdb_generated.h` is included in the release zip alongside `HyperDB.h`.
 
 ---
 
@@ -236,7 +247,9 @@ cluster.ForceFlush(58253);
 
 ## 🐍 Python Bindings
 
-Build `HyperDB.pyd` (Windows) or `HyperDB.so` (Linux) from `bindings.cpp`. Requires Python 3.x and the pybind11 headers.
+The Python module (`HyperDB.pyd` on Windows, `HyperDB.so` on Linux) is included in every release zip. Drop it next to your script and `import HyperDB`. No build step required.
+
+If you want to rebuild it from source, compile `bindings.cpp` against `HyperDB.lib` / `libHyperDB.a` with pybind11 headers. The CI workflow in `.github/workflows/` shows the exact CMake flags.
 
 ### Python — Solo DB
 
