@@ -46,11 +46,11 @@ target_include_directories(HyperDB PRIVATE
 # ---------------------------------------------------------------------------
 if(MSVC)
     target_link_libraries(HyperDB PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Python/include/lib/HyperDB.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/lib/HyperDB.lib
     )
 else()
     target_link_libraries(HyperDB PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Python/include/lib/libHyperDB.a
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/lib/libHyperDB.a
     )
 endif()
 

@@ -34,11 +34,11 @@ target_include_directories(HyperDB-Test PRIVATE
 # ---------------------------------------------------------------------------
 if(MSVC)
     target_link_libraries(HyperDB-Test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Test/include/lib/HyperDB.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/lib/HyperDB.lib
     )
 else()
     target_link_libraries(HyperDB-Test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/HyperDB-Test/include/lib/libHyperDB.a
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/lib/libHyperDB.a
     )
 endif()
 
