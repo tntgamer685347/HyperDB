@@ -1,696 +1,206 @@
 name: CMake Multi-Platform Build & Release
 
-
-
 on:
-
   push:
-
     branches: [ "main" ]
-
     tags: [ "*" ]
-
   pull_request:
-
     branches: [ "main" ]
-
   workflow_dispatch:
 
-    inputs:
-
-      debug_enabled:
-
-        description: 'Run the build with tmate debugging enabled'
-
-        required: false
-
-        default: false
-
-
-
 permissions:
-
   contents: write
 
-
-
 jobs:
-
   build:
-
     runs-on: ${{ matrix.os }}
-
     
-
     strategy:
-
       fail-fast: false
-
       matrix:
-
         include:
-
           - os: windows-latest
-
             c_compiler: cl
-
             cpp_compiler: cl
-
             platform: windows-msvc
-
             lib_name: HyperDB.lib
-
             python_lib_name: HyperDB.pyd
-
             test_exe: HyperDB-Test.exe
-
             
-
           - os: ubuntu-latest
-
             c_compiler: gcc
-
             cpp_compiler: g++
-
             platform: linux-gcc
-
             lib_name: libHyperDB.a
-
             python_lib_name: HyperDB.so
-
             test_exe: HyperDB-Test
-
             
-
           - os: ubuntu-latest
-
             c_compiler: clang
-
             cpp_compiler: clang++
-
             platform: linux-clang
-
             lib_name: libHyperDB.a
-
             python_lib_name: HyperDB.so
-
             test_exe: HyperDB-Test
-
-
 
     steps:
-
     - uses: actions/checkout@v4
-
-
 
     - name: Setup Python (Windows)
-
       if: runner.os == 'Windows'
-
       uses: actions/setup-python@v5
-
       with:
-
         python-version: '3.11'
-
         architecture: 'x64'
 
-
-
     - name: Install dependencies (Ubuntu)
-
       if: runner.os == 'Linux'
-
       run: |
-
         sudo apt-get update
-
         sudo apt-get install -y python3-dev python3-pip
-
         pip3 install pybind11 || true
 
-
-
-    # ======================================================================
-
-    # Build Base Library (NO Python)
-
-    # ======================================================================
-
-    - name: Configure Base Library
-
-      shell: bash
-
-      run: |
-
-        cmake -B build-base \
-
-          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
-
-          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
-
-          -DCMAKE_BUILD_TYPE=Release \
-
-          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-
-          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE="${{ github.workspace }}/lib" \
-
-          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="${{ github.workspace }}/lib" \
-
-          -S "${{ github.workspace }}"
-
-
-
     - name: Build Base Library
-
       shell: bash
-
-      run: cmake --build build-base --config Release --target HyperDB --parallel
-
-
-
-    - name: Find and Copy Library (Windows)
-
-      if: runner.os == 'Windows'
-
-      shell: pwsh
-
       run: |
-
-        New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/HyperDB-Test/include/lib"
-
-        $libPath = "${{ github.workspace }}/lib/${{ matrix.lib_name }}"
-
-        if (Test-Path $libPath) {
-
-          Copy-Item $libPath "${{ github.workspace }}/HyperDB-Test/include/lib/"
-
-          Write-Host "Copied library from $libPath"
-
-        } else {
-
-          # Try alternative locations
-
-          $altPaths = @(
-
-            "${{ github.workspace }}/build-base/Release/${{ matrix.lib_name }}",
-
-            "${{ github.workspace }}/build-base/${{ matrix.lib_name }}"
-
-          )
-
-          foreach ($path in $altPaths) {
-
-            if (Test-Path $path) {
-
-              Copy-Item $path "${{ github.workspace }}/HyperDB-Test/include/lib/"
-
-              Write-Host "Copied library from $path"
-
-              break
-
-            }
-
-          }
-
-        }
-
-
-
-    - name: Find and Copy Library (Linux)
-
-      if: runner.os == 'Linux'
-
-      shell: bash
-
-      run: |
-
-        mkdir -p "${{ github.workspace }}/HyperDB-Test/include/lib"
-
-        find "${{ github.workspace }}/build-base" -name "${{ matrix.lib_name }}" -type f -exec cp {} "${{ github.workspace }}/HyperDB-Test/include/lib/" \; || \
-
-        find "${{ github.workspace }}/lib" -name "${{ matrix.lib_name }}" -type f -exec cp {} "${{ github.workspace }}/HyperDB-Test/include/lib/" \;
-
-
-
-    # ======================================================================
-
-    # Build Test Executable
-
-    # ======================================================================
-
-    - name: Configure Test Executable
-
-      shell: bash
-
-      run: |
-
-        cmake -B build-test \
-
+        cmake -B build-base \
           -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
-
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
-
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -S "${{ github.workspace }}"
+        cmake --build build-base --config Release --target HyperDB --parallel
 
-          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE="${{ github.workspace }}/bin" \
-
-          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="${{ github.workspace }}/bin" \
-
-          -S "${{ github.workspace }}/HyperDB-Test"
-
-
+    - name: Copy Library to Test Dir
+      shell: bash
+      run: |
+        mkdir -p "${{ github.workspace }}/HyperDB-Test/include/lib"
+        find "${{ github.workspace }}/build-base" -name "${{ matrix.lib_name }}" -exec cp {} "${{ github.workspace }}/HyperDB-Test/include/lib/" \;
+        ls -la "${{ github.workspace }}/HyperDB-Test/include/lib/"
 
     - name: Build Test Executable
-
       shell: bash
-
-      run: cmake --build build-test --config Release --parallel
-
-
-
-    # ======================================================================
-
-    # Build Library with Python Support
-
-    # ======================================================================
-
-    - name: Configure Library (Python Module)
-
-      shell: bash
-
       run: |
+        cmake -B build-test \
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -S "${{ github.workspace }}/HyperDB-Test"
+        cmake --build build-test --config Release --parallel
 
+    - name: Build Python Library
+      shell: bash
+      run: |
         cmake -B build-pylib \
-
           -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
-
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
-
           -DCMAKE_BUILD_TYPE=Release \
-
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-
           -DBUILD_PYTHON_MODULE=ON \
-
-          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE="${{ github.workspace }}/pylib" \
-
-          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="${{ github.workspace }}/pylib" \
-
           -S "${{ github.workspace }}"
+        cmake --build build-pylib --config Release --target HyperDB --parallel
 
-
-
-    - name: Build Library (Python Module)
-
+    - name: Copy Library to Python Dir
       shell: bash
-
-      run: cmake --build build-pylib --config Release --target HyperDB --parallel
-
-
-
-    - name: Copy Python Library (Windows)
-
-      if: runner.os == 'Windows'
-
-      shell: pwsh
-
       run: |
-
-        New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/HyperDB-Python/include/lib"
-
-        $libPath = "${{ github.workspace }}/pylib/${{ matrix.lib_name }}"
-
-        if (Test-Path $libPath) {
-
-          Copy-Item $libPath "${{ github.workspace }}/HyperDB-Python/include/lib/"
-
-        } else {
-
-          $altPaths = @(
-
-            "${{ github.workspace }}/build-pylib/Release/${{ matrix.lib_name }}",
-
-            "${{ github.workspace }}/build-pylib/${{ matrix.lib_name }}"
-
-          )
-
-          foreach ($path in $altPaths) {
-
-            if (Test-Path $path) {
-
-              Copy-Item $path "${{ github.workspace }}/HyperDB-Python/include/lib/"
-
-              break
-
-            }
-
-          }
-
-        }
-
-
-
-    - name: Copy Python Library (Linux)
-
-      if: runner.os == 'Linux'
-
-      shell: bash
-
-      run: |
-
         mkdir -p "${{ github.workspace }}/HyperDB-Python/include/lib"
-
-        find "${{ github.workspace }}/build-pylib" -name "${{ matrix.lib_name }}" -type f -exec cp {} "${{ github.workspace }}/HyperDB-Python/include/lib/" \; || \
-
-        find "${{ github.workspace }}/pylib" -name "${{ matrix.lib_name }}" -type f -exec cp {} "${{ github.workspace }}/HyperDB-Python/include/lib/" \;
-
-
-
-    # ======================================================================
-
-    # Build Python Module
-
-    # ======================================================================
-
-    - name: Configure Python Module
-
-      shell: bash
-
-      run: |
-
-        cmake -B build-pymod \
-
-          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
-
-          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
-
-          -DCMAKE_BUILD_TYPE=Release \
-
-          -DCMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE="${{ github.workspace }}/pymod" \
-
-          -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${{ github.workspace }}/pymod" \
-
-          -S "${{ github.workspace }}/HyperDB-Python"
-
-
+        find "${{ github.workspace }}/build-pylib" -name "${{ matrix.lib_name }}" -exec cp {} "${{ github.workspace }}/HyperDB-Python/include/lib/" \;
+        ls -la "${{ github.workspace }}/HyperDB-Python/include/lib/"
 
     - name: Build Python Module
-
       shell: bash
-
-      run: cmake --build build-pymod --config Release --parallel
-
-
-
-    # ======================================================================
-
-    # Package Artifacts
-
-    # ======================================================================
-
-    - name: Package Artifacts (Windows)
-
-      if: runner.os == 'Windows'
-
-      shell: pwsh
-
       run: |
+        cmake -B build-pymod \
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -S "${{ github.workspace }}/HyperDB-Python"
+        cmake --build build-pymod --config Release --parallel
 
-        New-Item -ItemType Directory -Force -Path "artifacts/${{ matrix.platform }}"
-
-        
-
-        # Copy static library
-
-        $libSrc = "${{ github.workspace }}/lib/${{ matrix.lib_name }}"
-
-        if (Test-Path $libSrc) {
-
-          Copy-Item $libSrc "artifacts/${{ matrix.platform }}/"
-
-        } else {
-
-          Get-ChildItem -Path "${{ github.workspace }}/build-base" -Recurse -Filter "${{ matrix.lib_name }}" | Select-Object -First 1 | Copy-Item -Destination "artifacts/${{ matrix.platform }}/"
-
-        }
-
-        
-
-        # Copy header
-
-        Copy-Item "${{ github.workspace }}/HyperDB/HyperDB.h" "artifacts/${{ matrix.platform }}/"
-
-        
-
-        # Copy test executable
-
-        Get-ChildItem -Path "${{ github.workspace }}/bin" -Filter "${{ matrix.test_exe }}" | Select-Object -First 1 | Copy-Item -Destination "artifacts/${{ matrix.platform }}/"
-
-        if (-not (Test-Path "artifacts/${{ matrix.platform }}/${{ matrix.test_exe }}")) {
-
-          Get-ChildItem -Path "${{ github.workspace }}/build-test" -Recurse -Filter "${{ matrix.test_exe }}" | Select-Object -First 1 | Copy-Item -Destination "artifacts/${{ matrix.platform }}/"
-
-        }
-
-        
-
-        # Copy Python module
-
-        $pyMod = "${{ github.workspace }}/pymod/${{ matrix.python_lib_name }}"
-
-        if (Test-Path $pyMod) {
-
-          Copy-Item $pyMod "artifacts/${{ matrix.platform }}/"
-
-        } else {
-
-          Get-ChildItem -Path "${{ github.workspace }}/build-pymod" -Recurse -Filter "${{ matrix.python_lib_name }}" | Select-Object -First 1 | Copy-Item -Destination "artifacts/${{ matrix.platform }}/"
-
-        }
-
-        
-
-        # Copy bindings source
-
-        Copy-Item "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/main.cpp" "artifacts/${{ matrix.platform }}/bindings.cpp"
-
-
-
-    - name: Package Artifacts (Linux)
-
-      if: runner.os == 'Linux'
-
+    - name: Package Artifacts
       shell: bash
-
       run: |
-
         mkdir -p "artifacts/${{ matrix.platform }}"
-
         
-
-        # Find and copy library
-
-        find "${{ github.workspace }}/lib" -name "${{ matrix.lib_name }}" -type f -exec cp {} "artifacts/${{ matrix.platform }}/" \; || \
-
-        find "${{ github.workspace }}/build-base" -name "${{ matrix.lib_name }}" -type f -exec cp {} "artifacts/${{ matrix.platform }}/" \;
-
+        # Copy base library
+        find "${{ github.workspace }}/build-base" -name "${{ matrix.lib_name }}" -exec cp {} "artifacts/${{ matrix.platform }}/" \;
         
-
         # Copy header
-
         cp "${{ github.workspace }}/HyperDB/HyperDB.h" "artifacts/${{ matrix.platform }}/"
-
         
-
-        # Find and copy test executable
-
-        find "${{ github.workspace }}/bin" -name "${{ matrix.test_exe }}" -type f -exec cp {} "artifacts/${{ matrix.platform }}/" \; 2>/dev/null || \
-
-        find "${{ github.workspace }}/build-test" -name "${{ matrix.test_exe }}" -type f -exec cp {} "artifacts/${{ matrix.platform }}/" \;
-
-        chmod +x "artifacts/${{ matrix.platform }}/${{ matrix.test_exe }}"
-
+        # Copy test executable
+        find "${{ github.workspace }}/build-test" -name "${{ matrix.test_exe }}" -exec cp {} "artifacts/${{ matrix.platform }}/" \;
+        chmod +x "artifacts/${{ matrix.platform }}/${{ matrix.test_exe }}" 2>/dev/null || true
         
-
-        # Find and copy Python module
-
-        find "${{ github.workspace }}/pymod" -name "${{ matrix.python_lib_name }}" -type f -exec cp {} "artifacts/${{ matrix.platform }}/" \; 2>/dev/null || \
-
-        find "${{ github.workspace }}/build-pymod" -name "${{ matrix.python_lib_name }}" -type f -exec cp {} "artifacts/${{ matrix.platform }}/" \;
-
+        # Copy Python module
+        find "${{ github.workspace }}/build-pymod" -name "${{ matrix.python_lib_name }}" -exec cp {} "artifacts/${{ matrix.platform }}/" \;
         
-
         # Copy bindings source
-
         cp "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/main.cpp" "artifacts/${{ matrix.platform }}/bindings.cpp"
+        
+        echo "=== Artifacts ==="
+        ls -la "artifacts/${{ matrix.platform }}/"
 
-
-
-    - name: List Artifacts
-
-      shell: bash
-
-      run: ls -la "artifacts/${{ matrix.platform }}/"
-
-
-
-    - name: Upload Build Artifacts
-
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
-
       with:
-
         name: hyperdb-${{ matrix.platform }}
-
         path: artifacts/${{ matrix.platform }}/
-
         retention-days: 7
 
-
-
   release:
-
     needs: build
-
     runs-on: ubuntu-latest
-
-    if: startsWith(github.ref, 'refs/tags/v')
-
+    if: startsWith(github.ref, 'refs/tags/')
     
-
     steps:
-
     - uses: actions/checkout@v4
 
-
-
-    - name: Download All Artifacts
-
+    - name: Download Artifacts
       uses: actions/download-artifact@v4
-
       with:
-
         path: artifacts
-
         pattern: hyperdb-*
 
-
-
-    - name: Create Release Archives
-
+    - name: Create Archives
       run: |
-
         cd artifacts
-
         for dir in hyperdb-*/; do
-
           platform=$(basename "$dir" | sed 's/hyperdb-//')
-
           cd "$dir"
-
           zip -r "../hyperdb-${platform}-${{ github.ref_name }}.zip" *
-
           cd ..
-
         done
 
-
-
-    - name: Create Release Notes
-
-      run: |
-
-        cat > RELEASE_NOTES.md << 'EOF'
-
-# HyperDB ${{ github.ref_name }}
-
-
-
-## Included Binaries
-
-
-
-### Windows (MSVC)
-
-- `HyperDB.lib` - Static library for C++
-
-- `HyperDB.pyd` - Python module
-
-- `HyperDB-Test.exe` - Test executable
-
-- `HyperDB.h` - Header file
-
-- `bindings.cpp` - Python bindings source
-
-
-
-### Linux (GCC & Clang)
-
-- `libHyperDB.a` - Static library for C++
-
-- `HyperDB.so` - Python module
-
-- `HyperDB-Test` - Test executable
-
-- `HyperDB.h` - Header file
-
-- `bindings.cpp` - Python bindings source
-
-
-
-## Usage
-
-
-
-### C++ Static Library
-
-Link against `HyperDB.lib` (Windows) or `libHyperDB.a` (Linux) and include `HyperDB.h`.
-
-
-
-### Python Module
-
-```python
-
-import HyperDB
-
-db = HyperDB.HyperDBManager()
-
-db.open_db("test.db", "", False)  # Nitro mode
-
-```
-
-
-
-## Build Info
-
-- Built with CMake Release configuration
-
-- C++20 standard
-
-- Python 3.11+ compatible
-
-EOF
-
-
-
-    - name: Create GitHub Release
-
+    - name: Create Release
       uses: softprops/action-gh-release@v1
-
       with:
-
         files: artifacts/*.zip
-
-        body_path: RELEASE_NOTES.md
-
+        name: ${{ github.ref_name }}
+        body: |
+          HyperDB ${{ github.ref_name }}
+          
+          ## Included Binaries
+          
+          ### Windows (MSVC)
+          - `HyperDB.lib` - Static library for C++
+          - `HyperDB.pyd` - Python module
+          - `HyperDB-Test.exe` - Test executable
+          - [HyperDB.h](cci:7://file:///c:/Users/tnt/source/repos/HyperDB/HyperDB/HyperDB.h:0:0-0:0) - Header file
+          - `bindings.cpp` - Python bindings source
+          
+          ### Linux (GCC & Clang)
+          - `libHyperDB.a` - Static library for C++
+          - `HyperDB.so` - Python module
+          - [HyperDB-Test](cci:9://file:///c:/Users/tnt/source/repos/HyperDB/HyperDB-Test:0:0-0:0) - Test executable
+          - [HyperDB.h](cci:7://file:///c:/Users/tnt/source/repos/HyperDB/HyperDB/HyperDB.h:0:0-0:0) - Header file
+          - `bindings.cpp` - Python bindings source
+          
+          ## Build Info
+          - CMake Release configuration
+          - C++20 standard
+          - Python 3.11+ compatible
         draft: false
-
         prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-
       env:
-
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
