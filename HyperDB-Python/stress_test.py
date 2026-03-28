@@ -29,12 +29,6 @@ def assert_test(condition, msg):
     else:
         print(f"  [OK]   {msg}")
 
-def wait_for_queue(db):
-    # hammering a lock from python is a great way to see how slow the GIL is.
-    # enjoy the show.
-    while not db.is_queue_empty():
-        time.sleep(0) # yield
-
 def run_solo_tests():
     print("\n[1] TESTING HYPERDB MANAGER (SOLO UNIT TESTS)")
     db = HyperDB.HyperDBManager()
@@ -48,12 +42,12 @@ def run_solo_tests():
         HyperDB.ColumnDef("id", HyperDB.ColumnType.Int32),
         HyperDB.ColumnDef("username", HyperDB.ColumnType.String)
     ])
-    wait_for_queue(db)
+    db.wait_for_queue()
     print(f"      > CreateTable took: {t.elapsed_ms():.2f} ms")
 
     t = Timer()
     db.queue_clear_table("test_table")
-    wait_for_queue(db)
+    db.wait_for_queue()
     print(f"      > ClearTable took: {t.elapsed_ms():.2f} ms")
     assert_test(db.get_row_count("test_table") == 0, "Row count is zero")
 
@@ -66,7 +60,7 @@ def run_solo_tests():
         HyperDB.RowData("id", 200),
         HyperDB.RowData("username", "batman")
     ])
-    wait_for_queue(db)
+    db.wait_for_queue()
     print(f"      > QueueWrite (2 Rows) took: {t.elapsed_ms():.2f} ms")
     assert_test(db.get_row_count("test_table") == 2, "Rows added correctly")
 
@@ -78,7 +72,7 @@ def run_solo_tests():
     # callback is passed directly. pybind11 handles the translation and gil. 
     # god help us all if i messed that up.
     db.queue_read("test_table", 1, read_callback)
-    wait_for_queue(db)
+    db.wait_for_queue()
     print(f"      > QueueRead (Callback) took: {t.elapsed_ms():.2f} ms")
     
     # checking results. index 1 in read_results[0] should be username batman.
@@ -91,7 +85,7 @@ def run_solo_tests():
 
     t = Timer()
     db.queue_delete("test_table", "username", "snayck")
-    wait_for_queue(db)
+    db.wait_for_queue()
     print(f"      > QueueDelete took: {t.elapsed_ms():.2f} ms")
     assert_test(db.get_row_count("test_table") == 1, "Row removed")
 
@@ -132,7 +126,7 @@ def run_cluster_write_benchmark():
         HyperDB.ColumnDef("noise2", HyperDB.ColumnType.String),
         HyperDB.ColumnDef("noise3", HyperDB.ColumnType.String)
     ])
-    wait_for_queue(cluster)
+    cluster.wait_for_queue()
     print(f"      > Cluster CreateTable took: {t.elapsed_ms():.2f} ms")
 
     total_write_timer = Timer()
@@ -157,7 +151,7 @@ def run_cluster_write_benchmark():
             pct = (current_rows / total_rows) * 100
             print(f"    > Progress: {int(pct)}% lap: {lap_timer.elapsed_ms():.2f} ms")
             lap_timer = Timer()
-            wait_for_queue(cluster)
+            cluster.wait_for_queue()
 
     print(f"  {get_timestamp()} write loop finished. Total Write Time: {total_write_timer.elapsed_ms():.2f} ms")
 
@@ -183,9 +177,9 @@ def perform_read_test(cluster, label):
         row_id = random.randint(0, total_rows - 1)
         cluster.queue_read("death", row_id, read_cb)
         if i % 10000 == 0: 
-            wait_for_queue(cluster)
+            cluster.wait_for_queue()
     
-    wait_for_queue(cluster)
+    cluster.wait_for_queue()
     elapsed = read_timer.elapsed_ms()
     rate = read_count / (elapsed / 1000.0) if elapsed > 0 else 0
     print(f"      > {label} reads t-total: {elapsed:.2f} ms ({rate:.2f} reads/sec)")
@@ -193,7 +187,7 @@ def perform_read_test(cluster, label):
     print("      > Full aggregate scan (cross-shard)...")
     t = Timer()
     cluster.queue_find("death", "noise1", "missing_no_9999", lambda res: None)
-    wait_for_queue(cluster)
+    cluster.wait_for_queue()
     print(f"      > Full Shard Scan took: {t.elapsed_ms():.2f} ms")
 
 def run_cluster_read_benchmark():

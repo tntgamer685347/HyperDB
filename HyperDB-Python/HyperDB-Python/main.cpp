@@ -129,7 +129,18 @@ PYBIND11_MODULE(HyperDB, m) {
         .def("get_row_count", &HyperDBManager::GetRowCount, "returns how many rows are in the table. right now")
         .def("is_queue_empty", &HyperDBManager::IsQueueEmpty, "is the manager actually doing anything?")
         .def("is_dirty", &HyperDBManager::IsDirty, "does the memory mirror have data that isn't on disk yet?")
-        .def("estimate_mirror_size", &HyperDBManager::EstimateMirrorSize, "rough guess of how much ram we're eating");
+        .def("estimate_mirror_size", &HyperDBManager::EstimateMirrorSize, "rough guess of how much ram we're eating")
+
+        // blocks until the worker queue is fully drained.
+        // releases the GIL while spinning so the worker thread can acquire it
+        // when it needs to fire a read/find callback. without the release you'd
+        // deadlock on any queue_find or queue_read call — the callback needs
+        // the GIL and your main thread is holding it in a busy loop. not ideal.
+        .def("wait_for_queue", [](HyperDBManager& self) {
+            while (!self.IsQueueEmpty())
+                std::this_thread::yield();
+        }, py::call_guard<py::gil_scoped_release>(),
+           "blocks until the worker queue is fully drained. use this instead of a manual sleep loop.");
 
     // -----------------------------------------------------------------------
     // HyperDBCluster - for when one file isn't enough pain
@@ -174,5 +185,14 @@ PYBIND11_MODULE(HyperDB, m) {
 
         .def("get_row_count", &HyperDBCluster::GetRowCount)
         .def("get_shard_count", &HyperDBCluster::GetShardCount)
-        .def("get_active_shard", &HyperDBCluster::GetActiveShard);
+        .def("get_active_shard", &HyperDBCluster::GetActiveShard)
+
+        // same GIL release pattern as HyperDBManager.wait_for_queue.
+        // cluster IsQueueEmpty checks all shards — if any shard still has work,
+        // we keep spinning. the GIL release lets all of them fire their callbacks.
+        .def("wait_for_queue", [](HyperDBCluster& self) {
+            while (!self.IsQueueEmpty())
+                std::this_thread::yield();
+        }, py::call_guard<py::gil_scoped_release>(),
+           "blocks until all shard worker queues are fully drained. use this instead of a manual sleep loop.");
 }
