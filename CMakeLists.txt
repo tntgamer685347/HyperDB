@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Option to build as Python module (includes pybind11 exports)
+option(BUILD_PYTHON_MODULE "Build as Python module (includes pybind11 exports)" OFF)
+
 # force multicore build on msvc because life is too short to wait for cl.exe
 # and statically link the runtime because dll hell is real.
 if(MSVC)
@@ -53,6 +56,7 @@ target_link_libraries(HyperDB PUBLIC ${Python3_LIBRARIES})
 target_compile_definitions(HyperDB PRIVATE
     $<$<CONFIG:Debug>:_DEBUG>
     $<$<CONFIG:Release>:NDEBUG>
+    $<$<BOOL:${BUILD_PYTHON_MODULE}>:BUILD_PYTHON_MODULE>
 )
 
 # ---------------------------------------------------------------------------
