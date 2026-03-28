@@ -246,10 +246,10 @@ import time
 
 db = HyperDB.HyperDBManager()
 
-# Nitro Mode
-db.open_db("users.db", encrypt=False)
+# Nitro Mode — no password needed, no encryption, instant open
+db.open_db("users.db", "", False)
 
-# Fort Knox (default)
+# Fort Knox (default) — encrypted at rest
 # db.open_db("users.db", "sandwich")
 
 db.queue_create_table("users", [
