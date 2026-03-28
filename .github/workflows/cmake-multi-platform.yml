@@ -125,8 +125,12 @@ jobs:
         # Copy base library
         find "${{ github.workspace }}/build-base" -name "${{ matrix.lib_name }}" -exec cp {} "artifacts/${{ matrix.platform }}/" \;
         
-        # Copy header
+        # Headers: one include root — add this folder to your compile (-I) and
+        # HyperDB.h's flatbuffers / schema includes resolve correctly.
         cp "${{ github.workspace }}/HyperDB/HyperDB.h" "artifacts/${{ matrix.platform }}/"
+        cp "${{ github.workspace }}/HyperDB/include/hyperdb_generated.h" "artifacts/${{ matrix.platform }}/"
+        mkdir -p "artifacts/${{ matrix.platform }}/flatbuffers"
+        cp -R "${{ github.workspace }}/HyperDB/include/flatbuffers/." "artifacts/${{ matrix.platform }}/flatbuffers/"
         
         # Copy test executable
         find "${{ github.workspace }}/build-test" -name "${{ matrix.test_exe }}" -exec cp {} "artifacts/${{ matrix.platform }}/" \;
@@ -186,15 +190,19 @@ jobs:
           - `HyperDB.lib` - Static library for C++
           - `HyperDB.pyd` - Python module
           - `HyperDB-Test.exe` - Test executable
-          - [HyperDB.h](cci:7://file:///c:/Users/tnt/source/repos/HyperDB/HyperDB/HyperDB.h:0:0-0:0) - Header file
           - `bindings.cpp` - Python bindings source
           
           ### Linux (GCC & Clang)
           - `libHyperDB.a` - Static library for C++
           - `HyperDB.so` - Python module
-          - [HyperDB-Test](cci:9://file:///c:/Users/tnt/source/repos/HyperDB/HyperDB-Test:0:0-0:0) - Test executable
-          - [HyperDB.h](cci:7://file:///c:/Users/tnt/source/repos/HyperDB/HyperDB/HyperDB.h:0:0-0:0) - Header file
+          - `HyperDB-Test` - Test executable
           - `bindings.cpp` - Python bindings source
+          
+          ### C++ headers (all platforms)
+          Add the zip root to your include path (e.g. `-I/path/to/extract`). The archive contains:
+          - `HyperDB.h`
+          - `hyperdb_generated.h` (FlatBuffers types used by the API)
+          - `flatbuffers/` (header-only FlatBuffers runtime required by `HyperDB.h`)
           
           ## Build Info
           - CMake Release configuration
