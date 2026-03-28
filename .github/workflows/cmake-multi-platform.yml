@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Run the build with tmate debugging enabled'
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -296,41 +301,41 @@ jobs:
     - name: Create Release Notes
       run: |
         cat > RELEASE_NOTES.md << 'EOF'
-# HyperDB ${{ github.ref_name }}
+        # HyperDB ${{ github.ref_name }}
 
-## Included Binaries
+        ## Included Binaries
 
-### Windows (MSVC)
-- `HyperDB.lib` - Static library for C++
-- `HyperDB.pyd` - Python module
-- `HyperDB-Test.exe` - Test executable
-- `HyperDB.h` - Header file
-- `bindings.cpp` - Python bindings source
+        ### Windows (MSVC)
+        - `HyperDB.lib` - Static library for C++
+        - `HyperDB.pyd` - Python module
+        - `HyperDB-Test.exe` - Test executable
+        - `HyperDB.h` - Header file
+        - `bindings.cpp` - Python bindings source
 
-### Linux (GCC & Clang)
-- `libHyperDB.a` - Static library for C++
-- `HyperDB.so` - Python module
-- `HyperDB-Test` - Test executable
-- `HyperDB.h` - Header file
-- `bindings.cpp` - Python bindings source
+        ### Linux (GCC & Clang)
+        - `libHyperDB.a` - Static library for C++
+        - `HyperDB.so` - Python module
+        - `HyperDB-Test` - Test executable
+        - `HyperDB.h` - Header file
+        - `bindings.cpp` - Python bindings source
 
-## Usage
+        ## Usage
 
-### C++ Static Library
-Link against `HyperDB.lib` (Windows) or `libHyperDB.a` (Linux) and include `HyperDB.h`.
+        ### C++ Static Library
+        Link against `HyperDB.lib` (Windows) or `libHyperDB.a` (Linux) and include `HyperDB.h`.
 
-### Python Module
-```python
-import HyperDB
-db = HyperDB.HyperDBManager()
-db.open_db("test.db", "", False)  # Nitro mode
-```
+        ### Python Module
+        ```python
+        import HyperDB
+        db = HyperDB.HyperDBManager()
+        db.open_db("test.db", "", False)  # Nitro mode
+        ```
 
-## Build Info
-- Built with CMake Release configuration
-- C++20 standard
-- Python 3.11+ compatible
-EOF
+        ## Build Info
+        - Built with CMake Release configuration
+        - C++20 standard
+        - Python 3.11+ compatible
+        EOF
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v1
