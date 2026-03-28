@@ -286,9 +286,9 @@ db.queue_delete("users", "username", "batman",
     lambda count: print(f"Deleted {count} row(s)")
 )
 
-# time.sleep(0) = std::this_thread::yield(). mandatory in wait loops.
-while not db.is_queue_empty():
-    time.sleep(0)
+# blocks until the worker is done. releases the GIL correctly so callbacks can fire.
+# do not replace this with a time.sleep(0) loop. just don't.
+db.wait_for_queue()
 
 db.force_flush()
 
@@ -319,16 +319,14 @@ batch = [
 ]
 cluster.queue_write_bulk("logs", batch)
 
-while not cluster.is_queue_empty():
-    time.sleep(0)
-
+cluster.wait_for_queue()
 cluster.force_flush()
 ```
 
 ### Python API Notes
 
 - **Callbacks run on the worker thread.** The GIL is acquired automatically before your callback fires. You don't need to do anything special.
-- **`time.sleep(0)`** in wait loops is mandatory. Without it your main thread starves the worker on the L3 cache.
+- **`wait_for_queue()`** blocks until the worker is fully drained. It releases the GIL while spinning so callback threads can acquire it — use this instead of a manual `time.sleep(0)` loop, which doesn't release the GIL correctly and can deadlock on `queue_find` / `queue_read` callbacks.
 - **Omit columns freely.** HyperDB pads any unwritten columns with zero/empty defaults. The schema stays consistent.
 - **`ColumnType.Bytes`** accepts Python `bytes` objects for raw binary storage.
 
@@ -473,7 +471,7 @@ HyperDB is the **Workstation King**. Raw local ingestion throughput will smoke S
 
 7. **Manifest saves are throttled.** The cluster manifest writes at most once per second. `SaveManifestInternal` checks the elapsed time and marks `manifest_dirty_ = true` if the interval hasn't elapsed. `ForceFlush` bypasses this and always saves. If you're mid-benchmark and the process dies, the last second of manifest updates may be lost. The actual shard data is whatever was last flushed.
 
-8. **Python callbacks run on the worker thread.** GIL is acquired automatically. Use `time.sleep(0)` in wait loops or your main thread starves the worker.
+8. **Python — use `wait_for_queue()`.** The binding releases the GIL while spinning so worker threads can acquire it when firing callbacks. A manual `time.sleep(0)` loop does not release the GIL correctly and will deadlock on any `queue_find` or `queue_read` call.
 
 9. **Worker thread exceptions are caught.** If an `Exec*` call throws, the error is printed and the worker continues. The queue isn't dead. The shard isn't dead. The bad entry is silently eaten. This is a better outcome than a crashed process at 3AM, but you should still not throw from callbacks.
 
