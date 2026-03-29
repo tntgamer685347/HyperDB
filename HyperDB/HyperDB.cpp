@@ -1,11 +1,11 @@
 // hyperdb.cpp
-// when i wrote this code, only god and i understood what i was doing. now, only
-// god knows. — someone who has debugged this at 3am more times than they'd like
-// to admit
+// when i wrote this code, only god and i understood what i was doing. now, only god knows. - someone who has debugged this at 3am more times than they'd like to admit
+// WARNING: i really like switch statements lol.
 
 #include "HyperDB.h"
 
 //#define BUILD_PYTHON_MODULE // define if you want to use the lib file for the python bindings.
+// if this is defined the queue callback calls automatically aquire and realase GIL for python, if you use this without python it will likely crash because no GIL exists.
 // python bindings.
 #ifdef BUILD_PYTHON_MODULE
 #include <pybind11/pybind11.h>
@@ -17,11 +17,9 @@
 
 using nlohmann::json;
 
-// ═════════════════════════════════════════
 // HyperDBManager — coercion helpers
-// shared by execfind, execdelete, execwrite, execread. stop copy-pasting
+// shared by execfind, execdelete, execwrite, execread. stop copy-pasting (this took hours to move into singular "easy" functions.)
 // lambdas. deja vu intensifies every time i see another as_i64 lambda somewhere
-// ═════════════════════════════════════════
 
 int64_t HyperDBManager::CoerceI64(const HyperValue &v) noexcept {
   return std::visit(
@@ -55,10 +53,6 @@ double HyperDBManager::CoerceF64(const HyperValue &v) noexcept {
       },
       v);
 }
-
-// ═════════════════════════════════════════
-// HyperDBQueue
-// ═════════════════════════════════════════
 
 HyperDBQueue::HyperDBQueue(HyperDBManager *manager) : manager_(manager) {
   worker_thread_ = std::thread(&HyperDBQueue::ProcessQueue, this);
@@ -124,6 +118,7 @@ void HyperDBQueue::ProcessQueue() {
       try {
 #ifdef BUILD_PYTHON_MODULE
         if (is_callback_action) {
+          // gil_scoped_acquire will crash if not used by actual python.
           pybind11::gil_scoped_acquire acquire;
           Execute(std::move(entry));
         } else {
@@ -180,10 +175,6 @@ void HyperDBQueue::Execute(QueueEntry entry) {
   }
 }
 
-// ═════════════════════════════════════════
-// HyperDBManager — file i/o
-// ═════════════════════════════════════════
-
 void HyperDBManager::OpenDB(const std::string &path,
                             const std::string &password, bool encrypt) {
   std::lock_guard<std::mutex> lock(data_mutex_);
@@ -235,7 +226,7 @@ void HyperDBManager::OpenDB(const std::string &path,
   std::memcpy(&its, data.data() + 32, 4);
 
   // security floor: if stored iterations < 10000, someone tampered with the file
-  // or we're loading an old file. use minimum acceptable value.
+  // or we're loading an old file. use minimum acceptable value. (just to be sure)
   if (its < 10000) its = 10000; 
 
   uint8_t key[32];
@@ -275,7 +266,7 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
   }
 
   // security floor: if you try to save with iterations < 10000, we override.
-  // because saving with 1 iteration is basically just giving the password away.
+  // because saving with 1 iteration is basically just giving the password away. (not really but bruteforcing will take literal seconds.)
   if (iterations < 10000)
     iterations = 10000;
 
@@ -341,10 +332,6 @@ void HyperDBManager::SetEncryption(bool encrypt, const std::string &password) {
   password_ = password;
   dirty_ = true; // force a flush next time
 }
-
-// ═════════════════════════════════════════
-// HyperDBManager — queue dispatch
-// ═════════════════════════════════════════
 
 void HyperDBManager::QueueCreateDatabase(const std::string &name) {
   queue_.AddToQueue(
@@ -412,10 +399,6 @@ void HyperDBManager::QueueDelete(const std::string &table_name,
                                .delete_callback = std::move(callback)});
 }
 
-// ═════════════════════════════════════════
-// HyperDBManager — public accessors
-// ═════════════════════════════════════════
-
 int HyperDBManager::GetRowCount(const std::string &table_name) {
   std::lock_guard<std::mutex> lock(data_mutex_);
   TableMirror *t = FindTable(table_name);
@@ -428,10 +411,6 @@ bool HyperDBManager::IsDirty() { return dirty_; }
 size_t HyperDBManager::EstimateMirrorSize() {
     return estimated_size_.load();
 }
-
-// ═════════════════════════════════════════
-// HyperDBManager — exec implementations
-// ═════════════════════════════════════════
 
 void HyperDBManager::ExecCreateDatabase(const std::string &name) {
   std::lock_guard<std::mutex> lock(data_mutex_);
@@ -546,7 +525,7 @@ void HyperDBManager::ExecClearColumn(const std::string &table_name,
   for (const auto &b : col->bytes)
     estimated_size_ -= b.size();
 
-  // clear all the things. yes all of them. no, you can't just clear one.
+  // clear all the things. yes all of them. no, you can't just clear one. (random comment: i wanted to be a comedian when i was young hehe)
   col->i8.clear();
   col->i16.clear();
   col->i32.clear();
@@ -634,7 +613,7 @@ void HyperDBManager::ExecWrite(const std::string &table_name,
         estimated_size_ += b.size();
         col->bytes.push_back(b);
       } else {
-        // someone's writing strings into bytes. degenerate behavior.
+        // someone's writing strings into bytes. degenerate behavior. (?? why would anyone do thatt ahhh)
         col->bytes.push_back({});
       }
       break;
@@ -643,7 +622,7 @@ void HyperDBManager::ExecWrite(const std::string &table_name,
   }
 
   // padding loop: if a column wasn't in the write, give it a default value.
-  // if you forget this, row_count drifts and the DB becomes a digital graveyard.
+  // if you dont do this, row_count drifts and the DB becomes a digital graveyard.
   for (auto &col : table->columns) {
     size_t target_len = table->row_count + 1;
     size_t current_len = 0;
@@ -667,7 +646,7 @@ void HyperDBManager::ExecWrite(const std::string &table_name,
     if (current_len < target_len) {
       auto def = GetDefaultValue(col.type);
       size_t diff = target_len - current_len;
-      switch (col.type) {
+      switch (col.type) { // ugly ahh switch statement lol
       case HyperDB::ColumnType::ColumnType_Int8:
         col.i8.resize(target_len, std::get<int8_t>(def));
         estimated_size_ += diff * sizeof(int8_t);
@@ -745,7 +724,7 @@ void HyperDBManager::ExecWriteBulk(const std::string &table_name,
         continue;
 
       ColumnMirror *col = &table->columns[it->second];
-      switch (col->type) {
+      switch (col->type) { // i wish i knew a way to make these cleaner.
       case HyperDB::ColumnType::ColumnType_Int8:
         col->i8.push_back(static_cast<int8_t>(CoerceI64(rd.value)));
         size_accum += sizeof(int8_t);
@@ -817,7 +796,7 @@ void HyperDBManager::ExecWriteBulk(const std::string &table_name,
     for (auto &col : table->columns) {
       size_t target_len = table->row_count + 1;
       size_t current_len = 0;
-      switch (col.type) {
+      switch (col.type) { // TODO: make switch statement as compact as possible because why not. - DONE
       case HyperDB::ColumnType::ColumnType_Int8: current_len = col.i8.size(); break;
       case HyperDB::ColumnType::ColumnType_Int16: current_len = col.i16.size(); break;
       case HyperDB::ColumnType::ColumnType_Int32: current_len = col.i32.size(); break;
@@ -837,7 +816,7 @@ void HyperDBManager::ExecWriteBulk(const std::string &table_name,
       if (current_len < target_len) {
         auto def = GetDefaultValue(col.type);
         size_t diff = target_len - current_len;
-        switch (col.type) {
+        switch (col.type) { // TODO: make switch statement as compact as possible becase why not. - DONE
           case HyperDB::ColumnType::ColumnType_Int8: col.i8.resize(target_len, std::get<int8_t>(def)); size_accum += diff * sizeof(int8_t); break;
           case HyperDB::ColumnType::ColumnType_Int16: col.i16.resize(target_len, std::get<int16_t>(def)); size_accum += diff * sizeof(int16_t); break;
           case HyperDB::ColumnType::ColumnType_Int32: col.i32.resize(target_len, std::get<int32_t>(def)); size_accum += diff * sizeof(int32_t); break;
@@ -878,7 +857,7 @@ void HyperDBManager::ExecRead(const std::string &table_name, uint64_t row_id,
         result.push_back({col.name, GetValueAtIndex(col, row_id)});
     } catch (const std::exception &e) {
       // if we get here, someone wrote fewer values than row_count says.
-      // that's a you problem, future me.
+      // that's a you problem, future me. (i will PROBABLY regret this but who knows?)
       printf("CRITICAL ERROR IN EXECREAD: %s\n", e.what());
       if (callback)
         callback({});
@@ -911,7 +890,7 @@ void HyperDBManager::ExecFind(
     }
 
     // coerce the search value exactly once, outside the loop.
-    // not inside. never again inside. i learned this the hard way.
+    // not inside. never again inside. did it once, never trying that again.
     const int64_t needle_i64 = CoerceI64(val);
     const uint64_t needle_u64 = CoerceU64(val);
     const double needle_f64 = CoerceF64(val);
@@ -920,14 +899,13 @@ void HyperDBManager::ExecFind(
             ? HyperDBUtil::HyperValueToString(val)
             : std::string{};
 
-    // matching row indices. we collect indices first, build ReadResults after.
+    // matching row indices. we collect indices first, build ReadResults after. (FANCY!)
     // avoids re-locking or touching other columns during the hot scan.
     std::vector<uint64_t> hits;
-    hits.reserve(16); // pray that's enough. it usually is.
+    hits.reserve(64); // pray that's enough. it usually is. (had to upgrade from 16 to 64) - i should probably make the reservations dynamic with an argument. yes i mean you, future me.
 
-    // dispatch once on type, then raw typed scan — zero variant overhead in the
-    // loop
-    switch (col->type) {
+    // dispatch once on type, then raw typed scan — zero variant overhead in the loop
+    switch (col->type) { // big boi
     case HyperDB::ColumnType::ColumnType_Int8: {
       auto n = static_cast<int8_t>(needle_i64);
       for (uint64_t i = 0; i < table->row_count; ++i)
@@ -983,8 +961,7 @@ void HyperDBManager::ExecFind(
       break;
     }
     case HyperDB::ColumnType::ColumnType_Float32: {
-      // float equality. i am not sorry. if you want epsilon control, make a
-      // rangeFind.
+      // float equality. i am not sorry. if you want epsilon control, make a rangeFind.  (atleast thats what someone on stackoverflow said)
       auto n = static_cast<float>(needle_f64);
       for (uint64_t i = 0; i < table->row_count; ++i)
         if (std::fabs(col->f32[i] - n) < 1e-6f)
@@ -1167,8 +1144,8 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
   int count = static_cast<int>(to_delete.size());
 
   // erase in reverse so indices don't shift under us.
-  // this code has been here since 2023. don't fucking touch it.
-  for (auto &c : table->columns) {
+  // this code has been here since the beginning. don't fucking touch it!
+  for (auto &c : table->columns) { // big boi loop with big boii switch statement
     for (auto it = to_delete.rbegin(); it != to_delete.rend(); ++it) {
       size_t idx = *it;
       switch (c.type) {
@@ -1235,10 +1212,6 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
     callback(count);
 }
 
-// ═════════════════════════════════════════
-// HyperDBManager — private helpers
-// ═════════════════════════════════════════
-
 TableMirror *HyperDBManager::FindTable(const std::string &name) {
   auto it = mirror_.table_map.find(name);
   if (it != mirror_.table_map.end() && it->second < mirror_.tables.size())
@@ -1258,7 +1231,7 @@ HyperValue HyperDBManager::GetValueAtIndex(const ColumnMirror &col,
                                            uint64_t idx) {
   // this boxes into a variant. only acceptable for reads and result-building.
   // do not call this inside a scan loop or i will find you.
-  switch (col.type) {
+  switch (col.type) { // my like one hundred of these switch statements lol.
   case HyperDB::ColumnType::ColumnType_Int8:
     return col.i8.at(idx);
   case HyperDB::ColumnType::ColumnType_Int16:
@@ -1286,8 +1259,7 @@ HyperValue HyperDBManager::GetValueAtIndex(const ColumnMirror &col,
   case HyperDB::ColumnType::ColumnType_Bytes:
     return idx < col.bytes.size() ? col.bytes[idx] : std::vector<uint8_t>{};
   default:
-    return int8_t(0); // if we reach here, the schema changed and i have no idea
-                      // what's going on
+    return int8_t(0); // if we reach here, the schema changed and i have no idea whats going on
   }
 }
 
@@ -1310,18 +1282,12 @@ HyperValue HyperDBManager::GetDefaultValue(HyperDB::ColumnType type) {
     }
 }
 
-// ─────────────────────────────────────────
-// SerializeFromMirror — here be dragons.
-// flatbuffers requires offsets to be created in reverse topological order.
-// if you change the order of these calls and things break, that's why.
-// ─────────────────────────────────────────
-
 flatbuffers::Offset<HyperDB::Database>
 HyperDBManager::SerializeFromMirror(flatbuffers::FlatBufferBuilder &builder) {
   std::vector<flatbuffers::Offset<HyperDB::Table>> table_offsets;
   table_offsets.reserve(mirror_.tables.size());
 
-  for (auto &tm : mirror_.tables) {
+  for (auto &tm : mirror_.tables) { // this ones a really big boi, dont even make me get started on the switch statement.
     std::vector<flatbuffers::Offset<HyperDB::Column>> col_offsets;
     col_offsets.reserve(tm.columns.size());
 
@@ -1476,7 +1442,7 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database *db) {
         estimated_size_ +=
             cm.name.length() + 8; // Add column name size + overhead
 
-        switch (col->type()) {
+        switch (col->type()) { // yes another really big boi
         case HyperDB::ColumnType::ColumnType_Int8:
           if (auto *c = col->data_as_Int8Column()) {
             cm.i8.assign(c->values()->begin(), c->values()->end());
@@ -1577,13 +1543,8 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database *db) {
     mirror_.table_map[mirror_.tables[i].name] = i;
   }
   // we already accumulated the size in 'estimated_size_' during the loops.
-  // do not call the locked EstimateMirrorSize() here or we'll deadlock our own
-  // open call. life is hard enough as it is.
+  // do not call the locked EstimateMirrorSize() here or we'll deadlock our own open call. life is hard enough as it is.
 }
-
-// ═════════════════════════════════════════
-// HyperDBCluster
-// ═════════════════════════════════════════
 
 void HyperDBCluster::Open(const std::string &folder, const std::string &name,
                           const std::string &password, size_t shard_limit_bytes,
@@ -1829,10 +1790,6 @@ int HyperDBCluster::GetRowCount(const std::string &table_name) {
   return total;
 }
 
-// ─────────────────────────────────────────
-// HyperDBCluster — private helpers
-// ─────────────────────────────────────────
-
 std::string HyperDBCluster::ShardPath(int index) const {
   return folder_ + "/" + name_ + "_shard" + std::to_string(index) + ".db";
 }
@@ -1860,7 +1817,7 @@ void HyperDBCluster::MaybeSpillToNewShard() {
       active_shard_index_++;
       OpenShard(active_shard_index_);
 
-      // teach the new shard the history of our universe.
+      // teach the new shard the history of our universe. (hehe universe)
       for (auto &[t_name, cols] : cluster_schemas_)
         shards_[active_shard_index_]->QueueCreateTable(t_name, cols);
 
