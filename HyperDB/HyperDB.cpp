@@ -11,9 +11,72 @@
 #include <pybind11/pybind11.h>
 #endif
 
+#include <cstdio>
+#include <future>
+#include <iostream>
 #include <json.hpp>
 #include <pbkdf2/pbkdf2-sha256.hpp>
 #include <tinyAES/aes.hpp>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+namespace {
+// best-effort secure zero. compiler can't elide because of the volatile pointer.
+inline void SecureZero(void *p, size_t n) noexcept {
+#ifdef _WIN32
+  ::SecureZeroMemory(p, n);
+#else
+  volatile uint8_t *vp = static_cast<volatile uint8_t *>(p);
+  while (n--) *vp++ = 0;
+#endif
+}
+
+// flush an ofstream all the way to disk. close-then-fsync the underlying fd.
+inline void FlushToDisk(std::ofstream &f, const std::string &path) {
+  f.flush();
+  f.close();
+#ifdef _WIN32
+  FILE *fp = nullptr;
+  if (fopen_s(&fp, path.c_str(), "rb") == 0 && fp) {
+    int fd = _fileno(fp);
+    if (fd >= 0) _commit(fd);
+    fclose(fp);
+  }
+#else
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) { ::fdatasync(fd); ::close(fd); }
+#endif
+}
+
+// write+rename for crash-safe file replacement. tmp gets fsync'd, then rename.
+// rename on the same filesystem is atomic on every OS we ship.
+inline void AtomicWriteFile(const std::string &path,
+                            const uint8_t *data, size_t size) {
+  std::string tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f.is_open())
+      throw std::runtime_error("HyperDB: failed to open " + tmp);
+    f.write(reinterpret_cast<const char *>(data),
+            static_cast<std::streamsize>(size));
+    FlushToDisk(f, tmp);
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    // rename failed (Windows can be picky if target exists). remove + rename.
+    std::filesystem::remove(path, ec);
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) throw std::runtime_error("HyperDB: rename failed for " + path +
+                                     ": " + ec.message());
+  }
+}
+} // namespace
 
 using nlohmann::json;
 
@@ -74,19 +137,6 @@ void HyperDBQueue::AddToQueue(QueueEntry entry) {
   cv_.notify_one();
 }
 
-void HyperDBQueue::AddToQueueBulk(std::vector<QueueEntry> entries) {
-  size_t count = entries.size();
-  if (count == 0)
-    return;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto &e : entries)
-      queue_.push(std::move(e));
-    queue_size_ += count;
-  }
-  cv_.notify_one();
-}
-
 bool HyperDBQueue::IsEmpty() { return queue_size_ == 0 && !worker_busy_; }
 
 void HyperDBQueue::ProcessQueue() {
@@ -109,8 +159,10 @@ void HyperDBQueue::ProcessQueue() {
         queue_size_--;
         has_entry = true;
         auto t = entry.action;
+        // delete also fires a user callback now, so it needs the gil too.
         is_callback_action =
-            (t == QueueActionType::Read || t == QueueActionType::Find);
+            (t == QueueActionType::Read || t == QueueActionType::Find ||
+             t == QueueActionType::Delete);
       }
     }
 
@@ -130,8 +182,10 @@ void HyperDBQueue::ProcessQueue() {
 #endif
       } catch (const std::exception &e) {
         // if we crash here, the worker thread would die and take the shard
-        // with it. we choose life.
-        printf("HYPERDB CRITICAL: Worker thread exception: %s\n", e.what());
+        // with it. we choose life. cerr is line-buffered — won't get sliced
+        // by other writers like printf can.
+        std::cerr << "HYPERDB CRITICAL: Worker thread exception: " << e.what()
+                  << std::endl;
       }
       worker_busy_ = false;
     }
@@ -213,41 +267,44 @@ void HyperDBManager::OpenDB(const std::string &path,
     return;
   }
 
-  std::vector<uint8_t> data(static_cast<size_t>(size));
-  file.read(reinterpret_cast<char *>(data.data()), size);
+  // read straight into file_buffer_; we'll decrypt in place over the cipher
+  // payload and pass the same buffer to the verifier. saves an entire 4GB
+  // copy on cold-open of a full shard.
+  file_buffer_.resize(static_cast<size_t>(size));
+  file.read(reinterpret_cast<char *>(file_buffer_.data()), size);
 
-  if (data.size() < 36)
+  if (file_buffer_.size() < 36)
     throw std::runtime_error("HyperDB: file too small to be valid.");
 
   uint8_t salt[16], iv[16];
   uint32_t its = 0;
-  std::memcpy(salt, data.data(), 16);
-  std::memcpy(iv, data.data() + 16, 16);
-  std::memcpy(&its, data.data() + 32, 4);
+  std::memcpy(salt, file_buffer_.data(), 16);
+  std::memcpy(iv, file_buffer_.data() + 16, 16);
+  std::memcpy(&its, file_buffer_.data() + 32, 4);
 
   // security floor: if stored iterations < 10000, someone tampered with the file
   // or we're loading an old file. use minimum acceptable value. (just to be sure)
-  if (its < 10000) its = 10000; 
+  if (its < 10000) its = 10000;
 
   uint8_t key[32];
-  PKCS5_PBKDF2_HMAC(const_cast<uint8_t *>(
-                        reinterpret_cast<const uint8_t *>(password.c_str())),
-                    password.length(), salt, 16, its, 32, key);
+  PKCS5_PBKDF2_HMAC(reinterpret_cast<uint8_t *>(const_cast<char *>(password.data())),
+                    password.size(), salt, 16, its, 32, key);
 
-  size_t cipher_len = data.size() - 36;
-  file_buffer_.resize(cipher_len);
-  std::memcpy(file_buffer_.data(), data.data() + 36, cipher_len);
+  uint8_t *cipher = file_buffer_.data() + 36;
+  size_t cipher_len = file_buffer_.size() - 36;
 
   AES_ctx ctx;
   AES_init_ctx_iv(&ctx, key, iv);
-  AES_CTR_xcrypt_buffer(&ctx, file_buffer_.data(),
-                        static_cast<uint32_t>(cipher_len));
+  AES_CTR_xcrypt_buffer(&ctx, cipher, static_cast<uint32_t>(cipher_len));
+  // key is no longer needed; nuke it before any throw can happen.
+  SecureZero(key, sizeof(key));
+  SecureZero(&ctx, sizeof(ctx));
 
-  flatbuffers::Verifier v(file_buffer_.data(), file_buffer_.size());
+  flatbuffers::Verifier v(cipher, cipher_len);
   if (!HyperDB::VerifyDatabaseBuffer(v))
     throw std::runtime_error("HyperDB: wrong password or corrupt file.");
 
-  DeserializeToMirror(HyperDB::GetDatabase(file_buffer_.data()));
+  DeserializeToMirror(HyperDB::GetDatabase(cipher));
   file_buffer_.clear();
   file_buffer_.shrink_to_fit();
 }
@@ -270,7 +327,11 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
   if (iterations < 10000)
     iterations = 10000;
 
-  flatbuffers::FlatBufferBuilder builder(1024 * 1024);
+  // size hint for the builder — avoids 8+ realloc/memcpy cycles on large mirrors.
+  // overshoot a little for the FB overhead.
+  size_t size_hint = estimated_size_.load() + 64 * 1024;
+  if (size_hint < 1024 * 1024) size_hint = 1024 * 1024;
+  flatbuffers::FlatBufferBuilder builder(size_hint);
   {
     std::lock_guard<std::mutex> lock_d(data_mutex_);
     auto db_offset = SerializeFromMirror(builder);
@@ -278,42 +339,43 @@ void HyperDBManager::FlushDB(uint32_t iterations) {
     dirty_ = false; // set false while locked to prevent race with ExecWrite
   }
 
-  std::ofstream file(db_path_, std::ios::binary | std::ios::trunc);
-  if (!file.is_open())
-    throw std::runtime_error("HyperDB: failed to write " + db_path_);
-
   if (!should_encrypt_) {
-    file.write(reinterpret_cast<const char *>(builder.GetBufferPointer()),
-               builder.GetSize());
+    AtomicWriteFile(db_path_, builder.GetBufferPointer(), builder.GetSize());
   } else {
     uint8_t salt[16], iv[16];
     SecureRandomBytes(salt, 16);
     SecureRandomBytes(iv, 16);
 
     uint8_t key[32];
-    PKCS5_PBKDF2_HMAC(const_cast<uint8_t *>(
-                          reinterpret_cast<const uint8_t *>(password_.c_str())),
-                      password_.length(), salt, 16, iterations, 32, key);
+    PKCS5_PBKDF2_HMAC(reinterpret_cast<uint8_t *>(const_cast<char *>(password_.data())),
+                      password_.size(), salt, 16, iterations, 32, key);
 
     size_t plain_len = builder.GetSize();
-    std::vector<uint8_t> cipher(plain_len);
-    std::memcpy(cipher.data(), builder.GetBufferPointer(), plain_len);
 
     // tinyAES CTR takes uint32_t for length. if we somehow exceed 4GB in a single shard,
-    // we need to chunk it or we'll overflow. given FB is 32-bit offset anyway, 
+    // we need to chunk it or we'll overflow. given FB is 32-bit offset anyway,
     // a 4GB shard is already a miracle. he who breaches 4GB deserves the crash.
-    if (plain_len > 0xFFFFFFFF) throw std::runtime_error("HyperDB: shard size exceeds AES-CTR-32 limit. use more shards.");
+    if (plain_len > 0xFFFFFFFF) {
+      SecureZero(key, sizeof(key));
+      throw std::runtime_error("HyperDB: shard size exceeds AES-CTR-32 limit. use more shards.");
+    }
+
+    // assemble [salt][iv][iter][cipher] then encrypt the cipher slice in place.
+    // single allocation, no extra memcpy of the plaintext payload.
+    std::vector<uint8_t> out(36 + plain_len);
+    std::memcpy(out.data(), salt, 16);
+    std::memcpy(out.data() + 16, iv, 16);
+    std::memcpy(out.data() + 32, &iterations, 4);
+    std::memcpy(out.data() + 36, builder.GetBufferPointer(), plain_len);
 
     AES_ctx ctx;
     AES_init_ctx_iv(&ctx, key, iv);
-    AES_CTR_xcrypt_buffer(&ctx, cipher.data(),
+    AES_CTR_xcrypt_buffer(&ctx, out.data() + 36,
                           static_cast<uint32_t>(plain_len));
+    SecureZero(key, sizeof(key));
+    SecureZero(&ctx, sizeof(ctx));
 
-    file.write(reinterpret_cast<const char *>(salt), 16);
-    file.write(reinterpret_cast<const char *>(iv), 16);
-    file.write(reinterpret_cast<const char *>(&iterations), 4);
-    file.write(reinterpret_cast<const char *>(cipher.data()),
-               static_cast<std::streamsize>(plain_len));
+    AtomicWriteFile(db_path_, out.data(), out.size());
   }
 
   last_flush_time_ = std::chrono::steady_clock::now();
@@ -329,8 +391,21 @@ void HyperDBManager::ForceFlush(uint32_t iterations) {
 void HyperDBManager::SetEncryption(bool encrypt, const std::string &password) {
   std::lock_guard<std::mutex> lock(data_mutex_);
   should_encrypt_ = encrypt;
+  // zero out the old password before overwriting. std::string::operator= can
+  // reuse the existing buffer, leaving the old contents readable in memory.
+  if (!password_.empty())
+    SecureZero(password_.data(), password_.size());
   password_ = password;
   dirty_ = true; // force a flush next time
+}
+
+HyperDBManager::~HyperDBManager() {
+  // password lives in std::string memory; std::string's destructor releases
+  // the allocation but does NOT wipe it first. zero it here before member
+  // destructors run. the queue worker doesn't touch password_, so this is
+  // safe to do while it's still alive (it joins via ~HyperDBQueue after).
+  if (!password_.empty())
+    SecureZero(password_.data(), password_.size());
 }
 
 void HyperDBManager::QueueCreateDatabase(const std::string &name) {
@@ -406,10 +481,10 @@ int HyperDBManager::GetRowCount(const std::string &table_name) {
 }
 
 bool HyperDBManager::IsQueueEmpty() { return queue_.IsEmpty(); }
-bool HyperDBManager::IsDirty() { return dirty_; }
+bool HyperDBManager::IsDirty() const noexcept { return dirty_.load(); }
 
-size_t HyperDBManager::EstimateMirrorSize() {
-    return estimated_size_.load();
+size_t HyperDBManager::EstimateMirrorSize() const noexcept {
+  return estimated_size_.load();
 }
 
 void HyperDBManager::ExecCreateDatabase(const std::string &name) {
@@ -428,6 +503,13 @@ void HyperDBManager::ExecCreateTable(const std::string &table_name,
   table.name = table_name;
   table.columns.reserve(cols.size());
   for (size_t i = 0; i < cols.size(); ++i) {
+    // duplicate column names would orphan the first ColumnMirror — column_map
+    // would point to the second, but both vectors would be in `columns`,
+    // diverging row counts forever. fail loudly instead.
+    if (table.column_map.find(cols[i].name) != table.column_map.end())
+      throw std::runtime_error(
+          "HyperDB: duplicate column name '" + cols[i].name +
+          "' in table '" + table_name + "'");
     ColumnMirror cm;
     cm.name = cols[i].name;
     cm.type = cols[i].type;
@@ -492,7 +574,12 @@ void HyperDBManager::ExecClearTable(const std::string &table_name) {
       estimated_size_ -= s.size();
     for (const auto &b : col.bytes)
       estimated_size_ -= b.size();
-    col = ColumnMirror{col.name, col.type}; // Clear data
+    // explicit per-vector clear is cheaper than reassigning a fresh
+    // ColumnMirror (which copies the name string).
+    col.i8.clear();   col.i16.clear(); col.i32.clear(); col.i64.clear();
+    col.u8.clear();   col.u16.clear(); col.u32.clear(); col.u64.clear();
+    col.f32.clear();  col.f64.clear(); col.bools.clear();
+    col.strings.clear(); col.bytes.clear();
   }
   table->row_count = 0;
   dirty_ = true;
@@ -716,126 +803,130 @@ void HyperDBManager::ExecWriteBulk(const std::string &table_name,
   if (!table)
     return;
 
+  const size_t batch_size = rows.size();
+  const size_t target_total = table->row_count + batch_size;
+
+  // 1) reserve every typed vector once. saves ~14 reallocations per column at
+  //    10k rows (vector growth doubles, log2(10000) ≈ 13.3).
+  for (auto &col : table->columns) {
+    switch (col.type) {
+    case HyperDB::ColumnType::ColumnType_Int8:    col.i8.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Int16:   col.i16.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Int32:   col.i32.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Int64:   col.i64.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_UInt8:   col.u8.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_UInt16:  col.u16.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_UInt32:  col.u32.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_UInt64:  col.u64.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Float32: col.f32.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Float64: col.f64.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Bool:    col.bools.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_String:  col.strings.reserve(target_total); break;
+    case HyperDB::ColumnType::ColumnType_Bytes:   col.bytes.reserve(target_total); break;
+    default: break;
+    }
+  }
+
+  // 2) per-row writes with a written-bitmap. avoids the expensive
+  //    size()-via-switch padding scan; we just push a default for every column
+  //    we didn't touch in this row. correctness-equivalent to the old
+  //    per-row padding because we do it once per row, not once at the end.
   size_t size_accum = 0;
+  std::vector<uint8_t> written(table->columns.size(), 0);
   for (const auto &row : rows) {
+    std::fill(written.begin(), written.end(), 0);
+
     for (const auto &rd : row) {
       auto it = table->column_map.find(rd.column_name);
       if (it == table->column_map.end())
         continue;
 
-      ColumnMirror *col = &table->columns[it->second];
-      switch (col->type) { // i wish i knew a way to make these cleaner.
+      size_t col_idx = it->second;
+      ColumnMirror *col = &table->columns[col_idx];
+      switch (col->type) {
       case HyperDB::ColumnType::ColumnType_Int8:
         col->i8.push_back(static_cast<int8_t>(CoerceI64(rd.value)));
-        size_accum += sizeof(int8_t);
-        break;
+        size_accum += sizeof(int8_t); break;
       case HyperDB::ColumnType::ColumnType_Int16:
         col->i16.push_back(static_cast<int16_t>(CoerceI64(rd.value)));
-        size_accum += sizeof(int16_t);
-        break;
+        size_accum += sizeof(int16_t); break;
       case HyperDB::ColumnType::ColumnType_Int32:
         col->i32.push_back(static_cast<int32_t>(CoerceI64(rd.value)));
-        size_accum += sizeof(int32_t);
-        break;
+        size_accum += sizeof(int32_t); break;
       case HyperDB::ColumnType::ColumnType_Int64:
-        col->i64.push_back(static_cast<int64_t>(CoerceI64(rd.value)));
-        size_accum += sizeof(int64_t);
-        break;
+        col->i64.push_back(CoerceI64(rd.value));
+        size_accum += sizeof(int64_t); break;
       case HyperDB::ColumnType::ColumnType_UInt8:
         col->u8.push_back(static_cast<uint8_t>(CoerceU64(rd.value)));
-        size_accum += sizeof(uint8_t);
-        break;
+        size_accum += sizeof(uint8_t); break;
       case HyperDB::ColumnType::ColumnType_UInt16:
         col->u16.push_back(static_cast<uint16_t>(CoerceU64(rd.value)));
-        size_accum += sizeof(uint16_t);
-        break;
+        size_accum += sizeof(uint16_t); break;
       case HyperDB::ColumnType::ColumnType_UInt32:
         col->u32.push_back(static_cast<uint32_t>(CoerceU64(rd.value)));
-        size_accum += sizeof(uint32_t);
-        break;
+        size_accum += sizeof(uint32_t); break;
       case HyperDB::ColumnType::ColumnType_UInt64:
-        col->u64.push_back(static_cast<uint64_t>(CoerceU64(rd.value)));
-        size_accum += sizeof(uint64_t);
-        break;
+        col->u64.push_back(CoerceU64(rd.value));
+        size_accum += sizeof(uint64_t); break;
       case HyperDB::ColumnType::ColumnType_Float32:
         col->f32.push_back(static_cast<float>(CoerceF64(rd.value)));
-        size_accum += sizeof(float);
-        break;
+        size_accum += sizeof(float); break;
       case HyperDB::ColumnType::ColumnType_Float64:
-        col->f64.push_back(static_cast<double>(CoerceF64(rd.value)));
-        size_accum += sizeof(double);
-        break;
+        col->f64.push_back(CoerceF64(rd.value));
+        size_accum += sizeof(double); break;
       case HyperDB::ColumnType::ColumnType_Bool:
-        col->bools.push_back(CoerceI64(rd.value) ? 1 : 0);
-        size_accum += sizeof(uint8_t);
-        break;
+        col->bools.push_back(CoerceI64(rd.value) ? 1u : 0u);
+        size_accum += sizeof(uint8_t); break;
       case HyperDB::ColumnType::ColumnType_String: {
-        if (std::holds_alternative<std::string>(rd.value)) {
-            const auto &s = std::get<std::string>(rd.value);
-            size_accum += s.size();
-            col->strings.push_back(s);
-        } else {
-            col->strings.push_back("");
-        }
+        // match ExecWrite: coerce non-strings via HyperValueToString so int-into-
+        // string column produces "123" rather than "". diverging here would mean
+        // bulk vs single writes give different stored values for the same input.
+        std::string s = HyperDBUtil::HyperValueToString(rd.value);
+        size_accum += s.size();
+        col->strings.push_back(std::move(s));
         break;
       }
       case HyperDB::ColumnType::ColumnType_Bytes: {
         if (std::holds_alternative<std::vector<uint8_t>>(rd.value)) {
-            const auto &b = std::get<std::vector<uint8_t>>(rd.value);
-            size_accum += b.size();
-            col->bytes.push_back(b);
+          const auto &b = std::get<std::vector<uint8_t>>(rd.value);
+          size_accum += b.size();
+          col->bytes.push_back(b);
         } else {
-            col->bytes.push_back({});
+          col->bytes.push_back({});
         }
         break;
       }
-      }
-    }
-
-    // padding loop for bulk
-    for (auto &col : table->columns) {
-      size_t target_len = table->row_count + 1;
-      size_t current_len = 0;
-      switch (col.type) { // TODO: make switch statement as compact as possible because why not. - DONE
-      case HyperDB::ColumnType::ColumnType_Int8: current_len = col.i8.size(); break;
-      case HyperDB::ColumnType::ColumnType_Int16: current_len = col.i16.size(); break;
-      case HyperDB::ColumnType::ColumnType_Int32: current_len = col.i32.size(); break;
-      case HyperDB::ColumnType::ColumnType_Int64: current_len = col.i64.size(); break;
-      case HyperDB::ColumnType::ColumnType_UInt8: current_len = col.u8.size(); break;
-      case HyperDB::ColumnType::ColumnType_UInt16: current_len = col.u16.size(); break;
-      case HyperDB::ColumnType::ColumnType_UInt32: current_len = col.u32.size(); break;
-      case HyperDB::ColumnType::ColumnType_UInt64: current_len = col.u64.size(); break;
-      case HyperDB::ColumnType::ColumnType_Float32: current_len = col.f32.size(); break;
-      case HyperDB::ColumnType::ColumnType_Float64: current_len = col.f64.size(); break;
-      case HyperDB::ColumnType::ColumnType_Bool: current_len = col.bools.size(); break;
-      case HyperDB::ColumnType::ColumnType_String: current_len = col.strings.size(); break;
-      case HyperDB::ColumnType::ColumnType_Bytes: current_len = col.bytes.size(); break;
       default: break;
       }
+      written[col_idx] = 1;
+    }
 
-      if (current_len < target_len) {
-        auto def = GetDefaultValue(col.type);
-        size_t diff = target_len - current_len;
-        switch (col.type) { // TODO: make switch statement as compact as possible becase why not. - DONE
-          case HyperDB::ColumnType::ColumnType_Int8: col.i8.resize(target_len, std::get<int8_t>(def)); size_accum += diff * sizeof(int8_t); break;
-          case HyperDB::ColumnType::ColumnType_Int16: col.i16.resize(target_len, std::get<int16_t>(def)); size_accum += diff * sizeof(int16_t); break;
-          case HyperDB::ColumnType::ColumnType_Int32: col.i32.resize(target_len, std::get<int32_t>(def)); size_accum += diff * sizeof(int32_t); break;
-          case HyperDB::ColumnType::ColumnType_Int64: col.i64.resize(target_len, std::get<int64_t>(def)); size_accum += diff * sizeof(int64_t); break;
-          case HyperDB::ColumnType::ColumnType_UInt8: col.u8.resize(target_len, std::get<uint8_t>(def)); size_accum += diff * sizeof(uint8_t); break;
-          case HyperDB::ColumnType::ColumnType_UInt16: col.u16.resize(target_len, std::get<uint16_t>(def)); size_accum += diff * sizeof(uint16_t); break;
-          case HyperDB::ColumnType::ColumnType_UInt32: col.u32.resize(target_len, std::get<uint32_t>(def)); size_accum += diff * sizeof(uint32_t); break;
-          case HyperDB::ColumnType::ColumnType_UInt64: col.u64.resize(target_len, std::get<uint64_t>(def)); size_accum += diff * sizeof(uint64_t); break;
-          case HyperDB::ColumnType::ColumnType_Float32: col.f32.resize(target_len, std::get<float>(def)); size_accum += diff * sizeof(float); break;
-          case HyperDB::ColumnType::ColumnType_Float64: col.f64.resize(target_len, std::get<double>(def)); size_accum += diff * sizeof(double); break;
-          case HyperDB::ColumnType::ColumnType_Bool: col.bools.resize(target_len, std::get<bool>(def) ? 1 : 0); size_accum += diff * sizeof(uint8_t); break;
-          case HyperDB::ColumnType::ColumnType_String: col.strings.resize(target_len, std::get<std::string>(def)); break;
-          case HyperDB::ColumnType::ColumnType_Bytes: col.bytes.resize(target_len, std::get<std::vector<uint8_t>>(def)); break;
-          default: break;
-        }
+    // pad columns this row didn't write — single push per missing column,
+    // no size()-via-switch needed because the bitmap already tells us.
+    for (size_t i = 0; i < table->columns.size(); ++i) {
+      if (written[i])
+        continue;
+      ColumnMirror &col = table->columns[i];
+      switch (col.type) {
+      case HyperDB::ColumnType::ColumnType_Int8:    col.i8.push_back(0);    size_accum += sizeof(int8_t); break;
+      case HyperDB::ColumnType::ColumnType_Int16:   col.i16.push_back(0);   size_accum += sizeof(int16_t); break;
+      case HyperDB::ColumnType::ColumnType_Int32:   col.i32.push_back(0);   size_accum += sizeof(int32_t); break;
+      case HyperDB::ColumnType::ColumnType_Int64:   col.i64.push_back(0);   size_accum += sizeof(int64_t); break;
+      case HyperDB::ColumnType::ColumnType_UInt8:   col.u8.push_back(0);    size_accum += sizeof(uint8_t); break;
+      case HyperDB::ColumnType::ColumnType_UInt16:  col.u16.push_back(0);   size_accum += sizeof(uint16_t); break;
+      case HyperDB::ColumnType::ColumnType_UInt32:  col.u32.push_back(0);   size_accum += sizeof(uint32_t); break;
+      case HyperDB::ColumnType::ColumnType_UInt64:  col.u64.push_back(0);   size_accum += sizeof(uint64_t); break;
+      case HyperDB::ColumnType::ColumnType_Float32: col.f32.push_back(0.f); size_accum += sizeof(float); break;
+      case HyperDB::ColumnType::ColumnType_Float64: col.f64.push_back(0.0); size_accum += sizeof(double); break;
+      case HyperDB::ColumnType::ColumnType_Bool:    col.bools.push_back(0); size_accum += sizeof(uint8_t); break;
+      case HyperDB::ColumnType::ColumnType_String:  col.strings.emplace_back(); break;
+      case HyperDB::ColumnType::ColumnType_Bytes:   col.bytes.emplace_back(); break;
+      default: break;
       }
     }
-    table->row_count++;
   }
+
+  table->row_count = target_total;
   estimated_size_ += size_accum;
   dirty_ = true;
 }
@@ -851,18 +942,13 @@ void HyperDBManager::ExecRead(const std::string &table_name, uint64_t row_id,
         callback({});
       return;
     }
-    try {
-      result.reserve(table->columns.size());
-      for (auto &col : table->columns)
-        result.push_back({col.name, GetValueAtIndex(col, row_id)});
-    } catch (const std::exception &e) {
-      // if we get here, someone wrote fewer values than row_count says.
-      // that's a you problem, future me. (i will PROBABLY regret this but who knows?)
-      printf("CRITICAL ERROR IN EXECREAD: %s\n", e.what());
-      if (callback)
-        callback({});
-      return;
-    }
+    // GetValueAtIndex now uses operator[] (no per-element bounds check). safe
+    // because we hold data_mutex_ and verified row_id < row_count, and the
+    // padding paths in ExecWrite/ExecWriteBulk maintain the invariant
+    // col_size == row_count for every column.
+    result.reserve(table->columns.size());
+    for (auto &col : table->columns)
+      result.push_back({col.name, GetValueAtIndex(col, row_id)});
   }
   if (callback)
     callback(std::move(result));
@@ -961,7 +1047,10 @@ void HyperDBManager::ExecFind(
       break;
     }
     case HyperDB::ColumnType::ColumnType_Float32: {
-      // float equality. i am not sorry. if you want epsilon control, make a rangeFind.  (atleast thats what someone on stackoverflow said)
+      // ABSOLUTE epsilon, not relative. for floats around 1e10 this is
+      // effectively bit-exact equality; for floats around 1e-10 everything
+      // matches. if you need magnitude-aware comparisons, scan the column
+      // yourself with QueueRead and apply your own predicate.
       auto n = static_cast<float>(needle_f64);
       for (uint64_t i = 0; i < table->row_count; ++i)
         if (std::fabs(col->f32[i] - n) < 1e-6f)
@@ -969,6 +1058,7 @@ void HyperDBManager::ExecFind(
       break;
     }
     case HyperDB::ColumnType::ColumnType_Float64: {
+      // see comment in Float32 — same absolute epsilon caveats apply here.
       for (uint64_t i = 0; i < table->row_count; ++i)
         if (std::fabs(col->f64[i] - needle_f64) < 1e-6)
           hits.push_back(i);
@@ -1038,96 +1128,80 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
           ? HyperDBUtil::HyperValueToString(val)
           : std::string{};
 
-  std::vector<size_t> to_delete;
-  to_delete.reserve(8);
+  // build a deletion bitmap in one type-dispatched scan. avoids the
+  // M*N-shift erase loop the old code did with vector::erase.
+  const uint64_t n_rows = table->row_count;
+  std::vector<uint8_t> deleted(n_rows, 0);
+  size_t hit_count = 0;
+
+  auto mark = [&](uint64_t i) { deleted[i] = 1; ++hit_count; };
 
   switch (col->type) {
   case HyperDB::ColumnType::ColumnType_Int8: {
     auto n = static_cast<int8_t>(needle_i64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->i8[i] == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->i8[i] == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Int16: {
     auto n = static_cast<int16_t>(needle_i64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->i16[i] == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->i16[i] == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Int32: {
     auto n = static_cast<int32_t>(needle_i64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->i32[i] == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->i32[i] == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Int64: {
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->i64[i] == needle_i64)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->i64[i] == needle_i64) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_UInt8: {
     auto n = static_cast<uint8_t>(needle_u64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->u8[i] == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->u8[i] == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_UInt16: {
     auto n = static_cast<uint16_t>(needle_u64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->u16[i] == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->u16[i] == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_UInt32: {
     auto n = static_cast<uint32_t>(needle_u64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->u32[i] == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->u32[i] == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_UInt64: {
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->u64[i] == needle_u64)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i) if (col->u64[i] == needle_u64) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Float32: {
     auto n = static_cast<float>(needle_f64);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (std::fabs(col->f32[i] - n) < 1e-6f)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i)
+      if (std::fabs(col->f32[i] - n) < 1e-6f) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Float64: {
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (std::fabs(col->f64[i] - needle_f64) < 1e-6)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i)
+      if (std::fabs(col->f64[i] - needle_f64) < 1e-6) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Bool: {
     bool n = (needle_i64 != 0);
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if ((col->bools[i] != 0) == n)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i)
+      if ((col->bools[i] != 0) == n) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_String: {
-    for (uint64_t i = 0; i < table->row_count; ++i)
-      if (col->strings[i] == needle_str)
-        to_delete.push_back(i);
+    for (uint64_t i = 0; i < n_rows; ++i)
+      if (col->strings[i] == needle_str) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Bytes: {
     if (std::holds_alternative<std::vector<uint8_t>>(val)) {
-        auto& n = std::get<std::vector<uint8_t>>(val);
-        for (uint64_t i = 0; i < table->row_count; ++i)
-          if (col->bytes[i] == n)
-            to_delete.push_back(i);
+      auto &n = std::get<std::vector<uint8_t>>(val);
+      for (uint64_t i = 0; i < n_rows; ++i)
+        if (col->bytes[i] == n) mark(i);
     }
     break;
   }
@@ -1135,77 +1209,143 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
     break;
   }
 
-  if (to_delete.empty()) {
+  if (hit_count == 0) {
     if (callback)
       callback(0);
     return;
   }
 
-  int count = static_cast<int>(to_delete.size());
+  int count = static_cast<int>(hit_count);
 
-  // erase in reverse so indices don't shift under us.
-  // this code has been here since the beginning. don't fucking touch it!
-  for (auto &c : table->columns) { // big boi loop with big boii switch statement
-    for (auto it = to_delete.rbegin(); it != to_delete.rend(); ++it) {
-      size_t idx = *it;
-      switch (c.type) {
-      case HyperDB::ColumnType::ColumnType_Int8:
-        estimated_size_ -= sizeof(int8_t);
-        c.i8.erase(c.i8.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Int16:
-        estimated_size_ -= sizeof(int16_t);
-        c.i16.erase(c.i16.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Int32:
-        estimated_size_ -= sizeof(int32_t);
-        c.i32.erase(c.i32.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Int64:
-        estimated_size_ -= sizeof(int64_t);
-        c.i64.erase(c.i64.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_UInt8:
-        estimated_size_ -= sizeof(uint8_t);
-        c.u8.erase(c.u8.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_UInt16:
-        estimated_size_ -= sizeof(uint16_t);
-        c.u16.erase(c.u16.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_UInt32:
-        estimated_size_ -= sizeof(uint32_t);
-        c.u32.erase(c.u32.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_UInt64:
-        estimated_size_ -= sizeof(uint64_t);
-        c.u64.erase(c.u64.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Float32:
-        estimated_size_ -= sizeof(float);
-        c.f32.erase(c.f32.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Float64:
-        estimated_size_ -= sizeof(double);
-        c.f64.erase(c.f64.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Bool:
-        estimated_size_ -= sizeof(uint8_t);
-        c.bools.erase(c.bools.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_String:
-        estimated_size_ -= c.strings[idx].length();
-        c.strings.erase(c.strings.begin() + idx);
-        break;
-      case HyperDB::ColumnType::ColumnType_Bytes:
-        estimated_size_ -= c.bytes[idx].size();
-        c.bytes.erase(c.bytes.begin() + idx);
-        break;
-      default:
-        break;
+  // two-pointer compaction per column. one pass, O(N) per column instead of
+  // the old O(N*M) erase-in-reverse loop. for each column we walk read=r,
+  // write=w forward; if !deleted[r], move element to position w and bump w.
+  // resize at the end. this is the entire perf win.
+  size_t size_drop = 0;
+  for (auto &c : table->columns) {
+    switch (c.type) {
+    case HyperDB::ColumnType::ColumnType_Int8: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.i8[w++] = c.i8[r];
+      c.i8.resize(w);
+      size_drop += hit_count * sizeof(int8_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Int16: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.i16[w++] = c.i16[r];
+      c.i16.resize(w);
+      size_drop += hit_count * sizeof(int16_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Int32: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.i32[w++] = c.i32[r];
+      c.i32.resize(w);
+      size_drop += hit_count * sizeof(int32_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Int64: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.i64[w++] = c.i64[r];
+      c.i64.resize(w);
+      size_drop += hit_count * sizeof(int64_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_UInt8: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.u8[w++] = c.u8[r];
+      c.u8.resize(w);
+      size_drop += hit_count * sizeof(uint8_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_UInt16: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.u16[w++] = c.u16[r];
+      c.u16.resize(w);
+      size_drop += hit_count * sizeof(uint16_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_UInt32: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.u32[w++] = c.u32[r];
+      c.u32.resize(w);
+      size_drop += hit_count * sizeof(uint32_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_UInt64: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.u64[w++] = c.u64[r];
+      c.u64.resize(w);
+      size_drop += hit_count * sizeof(uint64_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Float32: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.f32[w++] = c.f32[r];
+      c.f32.resize(w);
+      size_drop += hit_count * sizeof(float);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Float64: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.f64[w++] = c.f64[r];
+      c.f64.resize(w);
+      size_drop += hit_count * sizeof(double);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Bool: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r)
+        if (!deleted[r]) c.bools[w++] = c.bools[r];
+      c.bools.resize(w);
+      size_drop += hit_count * sizeof(uint8_t);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_String: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r) {
+        if (deleted[r]) {
+          size_drop += c.strings[r].size();
+        } else if (w != r) {
+          c.strings[w++] = std::move(c.strings[r]);
+        } else {
+          ++w;
+        }
       }
+      c.strings.resize(w);
+      break;
+    }
+    case HyperDB::ColumnType::ColumnType_Bytes: {
+      size_t w = 0;
+      for (size_t r = 0; r < n_rows; ++r) {
+        if (deleted[r]) {
+          size_drop += c.bytes[r].size();
+        } else if (w != r) {
+          c.bytes[w++] = std::move(c.bytes[r]);
+        } else {
+          ++w;
+        }
+      }
+      c.bytes.resize(w);
+      break;
+    }
+    default:
+      break;
     }
   }
+
+  estimated_size_ -= size_drop;
   table->row_count -= count;
   dirty_ = true;
   if (callback)
@@ -1231,33 +1371,22 @@ HyperValue HyperDBManager::GetValueAtIndex(const ColumnMirror &col,
                                            uint64_t idx) {
   // this boxes into a variant. only acceptable for reads and result-building.
   // do not call this inside a scan loop or i will find you.
-  switch (col.type) { // my like one hundred of these switch statements lol.
-  case HyperDB::ColumnType::ColumnType_Int8:
-    return col.i8.at(idx);
-  case HyperDB::ColumnType::ColumnType_Int16:
-    return col.i16.at(idx);
-  case HyperDB::ColumnType::ColumnType_Int32:
-    return col.i32.at(idx);
-  case HyperDB::ColumnType::ColumnType_Int64:
-    return col.i64.at(idx);
-  case HyperDB::ColumnType::ColumnType_UInt8:
-    return col.u8.at(idx);
-  case HyperDB::ColumnType::ColumnType_UInt16:
-    return col.u16.at(idx);
-  case HyperDB::ColumnType::ColumnType_UInt32:
-    return col.u32.at(idx);
-  case HyperDB::ColumnType::ColumnType_UInt64:
-    return col.u64.at(idx);
-  case HyperDB::ColumnType::ColumnType_Float32:
-    return col.f32.at(idx);
-  case HyperDB::ColumnType::ColumnType_Float64:
-    return col.f64.at(idx);
-  case HyperDB::ColumnType::ColumnType_Bool:
-    return static_cast<bool>(col.bools.at(idx));
-  case HyperDB::ColumnType::ColumnType_String:
-    return idx < col.strings.size() ? col.strings[idx] : "";
-  case HyperDB::ColumnType::ColumnType_Bytes:
-    return idx < col.bytes.size() ? col.bytes[idx] : std::vector<uint8_t>{};
+  // operator[] (no bounds check) — callers hold data_mutex_ and have already
+  // verified idx < row_count, and write paths pad every column to row_count.
+  switch (col.type) {
+  case HyperDB::ColumnType::ColumnType_Int8:    return col.i8[idx];
+  case HyperDB::ColumnType::ColumnType_Int16:   return col.i16[idx];
+  case HyperDB::ColumnType::ColumnType_Int32:   return col.i32[idx];
+  case HyperDB::ColumnType::ColumnType_Int64:   return col.i64[idx];
+  case HyperDB::ColumnType::ColumnType_UInt8:   return col.u8[idx];
+  case HyperDB::ColumnType::ColumnType_UInt16:  return col.u16[idx];
+  case HyperDB::ColumnType::ColumnType_UInt32:  return col.u32[idx];
+  case HyperDB::ColumnType::ColumnType_UInt64:  return col.u64[idx];
+  case HyperDB::ColumnType::ColumnType_Float32: return col.f32[idx];
+  case HyperDB::ColumnType::ColumnType_Float64: return col.f64[idx];
+  case HyperDB::ColumnType::ColumnType_Bool:    return static_cast<bool>(col.bools[idx]);
+  case HyperDB::ColumnType::ColumnType_String:  return col.strings[idx];
+  case HyperDB::ColumnType::ColumnType_Bytes:   return col.bytes[idx];
   default:
     return int8_t(0); // if we reach here, the schema changed and i have no idea whats going on
   }
@@ -1560,8 +1689,32 @@ void HyperDBCluster::Open(const std::string &folder, const std::string &name,
 
   if (std::filesystem::exists(manifest_path_)) {
     LoadManifest();
-    for (int i = 0; i <= active_shard_index_; i++)
-      OpenShard(i);
+
+    // parallel shard open. each shard's OpenDB does an independent file read
+    // + AES-CTR pass + flatbuffer deserialize — perfectly parallelizable.
+    // on encrypted mode this turns ~85s/4.2GB across 8 shards into roughly
+    // wall-clock = max(per-shard time), bounded by hardware threads.
+    // we pre-grow shards_ serially (vector can't be grown from threads),
+    // then launch OpenDB in parallel.
+    int total = active_shard_index_ + 1;
+    while (static_cast<int>(shards_.size()) < total)
+      shards_.push_back(std::make_unique<HyperDBManager>());
+
+    std::vector<std::future<void>> futures;
+    futures.reserve(total);
+    for (int i = 0; i < total; ++i) {
+      futures.push_back(std::async(std::launch::async, [this, i] {
+        shards_[i]->OpenDB(ShardPath(i), password_, should_encrypt_);
+      }));
+    }
+    // propagate the first exception to the caller; wait on all the rest so
+    // none leak past Open() with the shard half-loaded.
+    std::exception_ptr first_err;
+    for (auto &f : futures) {
+      try { f.get(); }
+      catch (...) { if (!first_err) first_err = std::current_exception(); }
+    }
+    if (first_err) std::rethrow_exception(first_err);
 
     // if we just loaded from disk, our in-memory schema tracker is empty.
     // grab the schema from shard 0 so any future shards don't get amnesia.
@@ -1764,18 +1917,35 @@ void HyperDBCluster::QueueFind(
 
 void HyperDBCluster::QueueDelete(const std::string &table_name,
                                  const std::string &column_name,
-                                 HyperValue value, ShardTarget target) {
+                                 HyperValue value, ShardTarget target,
+                                 std::function<void(int)> callback) {
   std::vector<int> indices;
   {
     std::lock_guard<std::mutex> lock(manifest_mutex_);
     indices = GetShardIndicesInternal(target);
   }
+  if (indices.empty()) {
+    if (callback) callback(0);
+    return;
+  }
+
+  // shared state lets us sum per-shard delete counts and fire the user
+  // callback exactly once when the last shard reports back. same pattern
+  // as QueueFind. shared_ptr because lambda capture by value duplicates
+  // the atomic; we want one counter shared across all closures.
+  auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(indices.size()));
+  auto total = std::make_shared<std::atomic<int>>(0);
+
   for (int idx : indices) {
-    shards_[idx]->QueueDelete(table_name, column_name, value,
-                              [this, table_name, idx](int count) {
-                                if (count > 0)
-                                  ShiftManifestEntries(table_name, idx, -count);
-                              });
+    shards_[idx]->QueueDelete(
+        table_name, column_name, value,
+        [this, table_name, idx, remaining, total, callback](int count) {
+          if (count > 0)
+            ShiftManifestEntries(table_name, idx, -count);
+          total->fetch_add(count);
+          if (--(*remaining) == 0)
+            if (callback) callback(total->load());
+        });
   }
 }
 
@@ -1805,24 +1975,37 @@ HyperDBManager &HyperDBCluster::ActiveShard() {
 }
 
 void HyperDBCluster::MaybeSpillToNewShard() {
+  // flushing the old shard can take seconds (encrypted, large mirror) — we
+  // don't want every other cluster operation blocked on it. so:
+  //   1. under the lock, decide whether to spill, advance active_shard_index,
+  //      open the new shard, replicate schemas, persist manifest.
+  //   2. drop the lock.
+  //   3. flush the (now no-longer-active) old shard.
+  // future writes go straight to the new active shard while the old one
+  // serializes/encrypts in the background.
+  HyperDBManager *old_shard_to_flush = nullptr;
   {
-      std::lock_guard<std::mutex> lock(manifest_mutex_);
-      if (shards_[active_shard_index_]->EstimateMirrorSize() < shard_limit_)
-          return;
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    if (shards_[active_shard_index_]->EstimateMirrorSize() < shard_limit_)
+      return;
 
-      // current shard is full. flush it so it doesn't sit dirty in memory.
-      // we can't lock data_mutex_ here but FlushDB has its own lock.
-      shards_[active_shard_index_]->FlushDB();
+    old_shard_to_flush = shards_[active_shard_index_].get();
 
-      active_shard_index_++;
-      OpenShard(active_shard_index_);
+    active_shard_index_++;
+    OpenShard(active_shard_index_);
 
-      // teach the new shard the history of our universe. (hehe universe)
-      for (auto &[t_name, cols] : cluster_schemas_)
-        shards_[active_shard_index_]->QueueCreateTable(t_name, cols);
+    // teach the new shard the history of our universe. (hehe universe)
+    for (auto &[t_name, cols] : cluster_schemas_)
+      shards_[active_shard_index_]->QueueCreateTable(t_name, cols);
 
-      SaveManifestInternal();
+    SaveManifestInternal();
   }
+
+  // FlushDB has its own flush_mutex_ + data_mutex_; safe to call without
+  // manifest_mutex_ held. while this runs, the new active shard is already
+  // accepting writes.
+  if (old_shard_to_flush)
+    old_shard_to_flush->FlushDB();
 }
 
 uint64_t HyperDBCluster::NextGlobalRowIdInternal(const std::string &table_name) {
@@ -1904,9 +2087,14 @@ void HyperDBCluster::SaveManifestInternal() {
   }
   j["tables"] = tables;
 
-  std::ofstream f(manifest_path_);
-  f << j.dump(2);
-  
+  // compact dump (no pretty-print) + atomic temp+rename so a mid-write crash
+  // can never leave a half-written manifest on disk. both pieces matter:
+  // compact halves the bytes, rename guarantees crash safety.
+  std::string serialized = j.dump();
+  AtomicWriteFile(manifest_path_,
+                  reinterpret_cast<const uint8_t *>(serialized.data()),
+                  serialized.size());
+
   last_manifest_save_ = now;
   manifest_dirty_ = false;
 }

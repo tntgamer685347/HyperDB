@@ -180,8 +180,17 @@ PYBIND11_MODULE(HyperDB, m) {
             }, target);
         }, py::arg("table_name"), py::arg("column_name"), py::arg("value"), py::arg("callback"), py::arg("target") = ShardTarget::All)
 
-        .def("queue_delete", &HyperDBCluster::QueueDelete,
-            py::arg("table_name"), py::arg("column_name"), py::arg("value"), py::arg("target") = ShardTarget::All)
+        .def("queue_delete", [](HyperDBCluster& self, const std::string& table_name, const std::string& column_name, HyperValue value, ShardTarget target, py::object callback) {
+            if (callback.is_none()) {
+                self.QueueDelete(table_name, column_name, value, target, nullptr);
+            } else {
+                py::function cb_func = py::reinterpret_borrow<py::function>(callback);
+                self.QueueDelete(table_name, column_name, value, target, [cb_func](int count) {
+                    py::gil_scoped_acquire acquire;
+                    cb_func(count);
+                });
+            }
+        }, py::arg("table_name"), py::arg("column_name"), py::arg("value"), py::arg("target") = ShardTarget::All, py::arg("callback") = py::none())
 
         .def("get_row_count", &HyperDBCluster::GetRowCount)
         .def("get_shard_count", &HyperDBCluster::GetShardCount)

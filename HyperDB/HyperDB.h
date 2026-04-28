@@ -180,7 +180,6 @@ public:
   ~HyperDBQueue();
 
   void AddToQueue(QueueEntry entry);
-  void AddToQueueBulk(std::vector<QueueEntry> entries);
   bool IsEmpty();
 
 private:
@@ -200,6 +199,7 @@ private:
 class HyperDBManager {
 public:
   HyperDBManager() : queue_(this) {}
+  ~HyperDBManager();
 
   // open or create a db file. throws on wrong password/corrupt data if
   // encrypt=true.
@@ -237,8 +237,8 @@ public:
   // synchronous read-only accessors (lock-safe)
   int GetRowCount(const std::string &table_name);
   bool IsQueueEmpty();
-  bool IsDirty();
-  size_t EstimateMirrorSize();
+  bool IsDirty() const noexcept;
+  size_t EstimateMirrorSize() const noexcept;
 
   const DatabaseMirror &GetMirror() const { return mirror_; }
 
@@ -288,9 +288,9 @@ private:
   std::vector<uint8_t> file_buffer_;
   std::mutex data_mutex_;
   std::mutex flush_mutex_;
-  bool dirty_ = false;
+  std::atomic<bool> dirty_{false};
   std::atomic<size_t> estimated_size_ = 0;
-  int64_t flush_interval_ms_ = 0;
+  std::atomic<int64_t> flush_interval_ms_{0};
   std::chrono::steady_clock::time_point last_flush_time_ =
       std::chrono::steady_clock::now();
 };
@@ -343,7 +343,8 @@ public:
                  ShardTarget target = ShardTarget::All);
   void QueueDelete(const std::string &table_name,
                    const std::string &column_name, HyperValue value,
-                   ShardTarget target = ShardTarget::All);
+                   ShardTarget target = ShardTarget::All,
+                   std::function<void(int)> callback = nullptr);
 
   int GetRowCount(const std::string &table_name);
   int GetShardCount() const { return static_cast<int>(shards_.size()); }
