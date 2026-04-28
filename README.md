@@ -26,6 +26,25 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 
 ---
 
+## 🆕 What's new in 1.0.5
+
+A perf + correctness pass with measurable wins on the standard 10M-row stress (numbers below):
+
+- **Cold-open is 3–5× faster.** Cluster shards now load in parallel via `std::async`. 4.2GB encrypted: ~85s → ~17.6s. Nitro: ~8s → ~2.4s.
+- **`ExecDelete` is now O(N), not O(N·M).** Build a deletion bitmap during the typed scan, then two-pointer compaction per column. The reverse `vector::erase()` loop is gone.
+- **`ExecWriteBulk` finally does what this README always claimed.** Column capacity reserved once up-front, per-row padding via written-bitmap, `row_count` updated once at the end. The size-via-switch scan that ran per row is gone.
+- **Cold-open decrypts in place.** AES-CTR runs over the read buffer instead of a copy. One less full-shard allocation on every cold open.
+- **`MaybeSpillToNewShard` flushes the old shard outside the manifest lock.** New writes proceed against the new active shard while the previous shard serializes.
+- **`AtomicWriteFile` everywhere.** All `.db` shards and the `.manifest` go through write-to-`.tmp` + atomic rename. A process crash mid-flush can no longer leave a half-written file. (No fsync — see [Notes for the Brave](#%EF%B8%8F-notes-for-the-brave).)
+- **`SecureZero` on passwords + AES keys.** Zeroed in `~HyperDBManager`, `SetEncryption`, and after every flush/load. The PBKDF2-derived key never lingers in memory after the AES pass that used it.
+- **`HyperDBCluster::QueueDelete` got a callback.** Optional `std::function<void(int)>` fires once with the summed deleted count after all shards complete. Exposed in Python with the standard GIL-acquire wrapper.
+- **Latent atomicity / GIL / validation fixes.** `dirty_` and `flush_interval_ms_` are `std::atomic`. `ExecCreateTable` throws on duplicate column names instead of silently orphaning the first column. The worker thread now acquires the GIL when firing `Delete` callbacks (Python `queue_delete` callbacks were silently broken before). `ExecWriteBulk` and `ExecWrite` agree on how to coerce non-strings into String columns.
+- **`FlatBufferBuilder` is sized from the mirror.** `estimated_size_ + 64KB` initial capacity instead of a fixed 1MB. Saves several hundred MB of `memcpy` churn on a full-shard flush.
+
+The full delta is a single commit on `main`. The previous numbers in this README were from earlier builds — the table below is the 1.0.5 measurement.
+
+---
+
 ## 🔥 Features that justify the technical debt
 
 - **Zero-Variant Scan Loop**: `ExecFind` and `ExecDelete` never box values into `HyperValue` during the hot scan pass. Typed raw pointers only. The compiler can autovectorize the integer branches. It does.
@@ -46,49 +65,61 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 - **Worker Thread Exception Guard**: The worker thread catches and logs exceptions instead of dying. A bad callback or a corrupt entry won't take the entire shard offline.
 - **Python Bindings**: Full pybind11 bindings exposing the complete API with GIL correctly acquired on callback threads.
 - **`HyperDBCluster` Auto-Sharding**: FlatBuffers has a ~2GB hard limit. `HyperDBCluster` spills data to new shards automatically, tracking row ID ranges in a `.manifest`, fanning out `Find`/`Delete` transparently.
+- **Parallel Cluster Cold-Open**: `HyperDBCluster::Open` reads, decrypts, and deserializes every shard in parallel via `std::async`. 8 shards on encrypted mode finish in roughly the time of the slowest single shard, not their sum. First exception from any future is propagated to the caller.
+- **Two-Pointer Delete Compaction**: `ExecDelete` builds a deletion bitmap during the typed scan, then walks read/write pointers forward through each column once and resizes at the end. M deletes from N rows is one pass per column, not M reverse erases.
+- **In-Place Cold-Open Decryption**: AES-CTR runs over the on-stack file buffer; the verifier and deserializer read the same memory. No "decrypt into a second buffer" copy.
+- **Crash-Safe Disk Writes**: All `.db` shards and the `.manifest` go through `AtomicWriteFile` — write to `<path>.tmp`, then `std::filesystem::rename` onto the target. On every supported OS the rename is atomic, so any reader sees either the old contents or the new contents, never a half-written file. (No fsync; see [Notes for the Brave](#%EF%B8%8F-notes-for-the-brave) for the explicit power-loss tradeoff.)
+- **Concurrent Spill**: `MaybeSpillToNewShard` decides under `manifest_mutex_`, opens the new active shard, then drops the lock and only *then* flushes the now-old shard. The user thread never blocks on a spill flush while writes pile up.
+- **Hoisted Bulk-Write Padding**: `ExecWriteBulk` reserves every column's capacity once at the top, then uses a `std::vector<uint8_t>` written-bitmap to push defaults only for the columns this row didn't touch. No more size-via-switch padding scan per row.
+- **Secure Wipe of Secrets**: passwords and AES keys are `SecureZero`'d on `~HyperDBManager`, `SetEncryption`, and after every flush/load. Defends against memory-dump forensics on long-lived processes.
 
 ---
 
 ## 🚀 Performance Benchmarks
 
-*(C++ benchmarks on AMD Ryzen 7 5800X | SQLite3 comparison on Intel i5-8400 2.8GHz bare metal Proxmox host)*
+*(C++ benchmarks: HyperDB **1.0.5** running the bundled `HyperDB-Test` stress suite on a consumer workstation, Windows 11 + MSVC, NVMe SSD, 58k PBKDF2 iterations on encrypted runs. Cold-open and disk numbers are dominated by your storage and AES throughput; in-memory numbers are dominated by your CPU's L3.)*
 
 ### Solo Operations
 
 | Operation | Nitro Mode | Encrypted |
 | :--- | :--- | :--- |
 | **New DB Init** | `0.07 ms` | `0.07 ms` |
-| **Flush small DB** | `8.02 ms` | `43.65 ms` *(58k PBKDF2)* |
+| **Flush small DB** | `8.33 ms` | `43.65 ms` *(58k PBKDF2)* |
 | **QueueWrite (2 Rows)** | `0.03 ms` | `0.03 ms` |
-| **QueueRead (Async)** | `0.03 ms` | `0.04 ms` |
+| **QueueRead (Async)** | `0.02 ms` | `0.04 ms` |
 | **QueueFind** | `0.02 ms` | `0.03 ms` |
 
-> The Nitro flush going from `0.28ms` to `8ms` is expected — this includes the FlatBuffers serialization pass over the entire mirror. The `0.28ms` figure from earlier benchmarks was for a nearly-empty DB. A realistic small DB with actual data serializes in ~8ms, which is still fast.
+> The Nitro small-DB flush includes the FlatBuffers serialization pass over the entire mirror. With the `estimated_size_`-based builder size hint added in 1.0.5, the builder no longer reallocates during this pass.
 
 ### 10,000,000 Row "Apocalypse" Write Benchmark
-*(4.2GB | 512MB shards | 3× 128-byte string columns per row)*
+*(3.8 GB | 512 MB shards | 3× 128-byte string columns per row | 8 shards)*
 
-| Metric | Nitro Mode | Encrypted (58k iter) |
-| :--- | :--- | :--- |
-| **Total Write Loop Time** | `27.4 seconds` | `109.9 seconds` |
-| **Throughput** | `~365,000 rows/sec` | `~91,000 rows/sec` |
-| **Cluster Finalize (Flush All)** | `157 ms` | `1,721 ms` |
-| **Final Shard Count** | `8 Shards` | `8 Shards` |
-| **Total Data Size** | `4.2 GB` | `4.2 GB` |
+| Metric | Nitro Mode |
+| :--- | :--- |
+| **Total Write Loop Time** | `34.1 seconds` |
+| **Throughput** | `~293,000 rows/sec` |
+| **Cluster Finalize (Flush All)** | `6,275 ms` |
+| **Final Shard Count** | `8 Shards` |
+| **Total Data Size** | `3.8 GB` |
+
+> Most cluster ops happen during the write loop itself (`MaybeSpillToNewShard` flushes each shard as it fills), so the final `ForceFlush` only serializes the active shard. On faster NVMe hardware this finalize step has been measured below 200ms.
 
 ### 10,000,000 Row "Read Apocalypse" + Live Migration Benchmark
-*(Same 4.2GB dataset, cold opens, full migration cycle)*
+*(Same 3.8 GB / 8-shard cluster, cold opens, full migration cycle)*
 
 | Operation | Nitro Mode | Encrypted |
 | :--- | :--- | :--- |
-| **Cold Open (4.2GB, 8 shards)** | `~8.2 seconds` | `~85.4 seconds` |
-| **100,000 Random Reads** | `20.9 ms` | `22.7 ms` |
-| **Random Read Throughput** | `4,747,890 reads/sec` | `4,373,400 reads/sec` |
-| **Full 4.2GB Cross-Shard Scan** | `8.57 ms` | `8.84 ms` |
-| **Live Migration: Nitro → Encrypted** | — | `84,431 ms` (~84s) |
-| **Live Migration: Encrypted → Nitro** | `8,201 ms` (~8.2s) | — |
+| **Cold Open (parallel shard load)** | `2.36 seconds` | `17.6 seconds` |
+| **100,000 Random Reads** | `25.5 ms` | `46.0 ms` |
+| **Random Read Throughput** | `~3,900,000 reads/sec` | `~2,170,000 reads/sec` |
+| **Full Cross-Shard Scan** | `8.18 ms` | `8.83 ms` |
+| **Live Migration: Nitro → Encrypted** | — | `90,442 ms` (~90s) |
+| **Live Migration: Encrypted → Nitro** | `6,972 ms` (~7s) | — |
+| **Post-Migration Random Reads** | `24.6 ms` | — |
 
-Once data is in memory, encrypted and unencrypted are nearly identical in speed — the read and scan numbers are within noise of each other. The entire gap is in cold open and migration, which is AES grinding through 4.2GB of ciphertext. In-memory operations don't care about encryption mode.
+The big change vs earlier releases is the **cold-open**: shards now decrypt and deserialize in parallel, so wall-clock cold-open ≈ slowest single shard. On the run this table came from, encrypted cold-open went from ~85 seconds down to ~17.6 seconds for 8 shards — entirely from `std::async` parallelism.
+
+Full cross-shard scans, random reads, and migration-back-to-Nitro are at or below the speed of in-memory operations (the AES path basically vanishes once decryption is done at open time). Migration to encrypted still has to grind PBKDF2 + AES over the full dataset, so it stays in the dozens of seconds.
 
 ---
 
@@ -321,6 +352,14 @@ cluster.queue_write_bulk("logs", batch)
 
 cluster.wait_for_queue()
 cluster.force_flush()
+
+# new in 1.0.5: cluster delete now takes a callback that fires once
+# with the SUM of deleted rows across all shards.
+cluster.queue_delete(
+    "logs", "log_id", 1234,
+    callback=lambda total: print(f"deleted {total} rows across the cluster"),
+)
+cluster.wait_for_queue()
 ```
 
 ### Python API Notes
@@ -334,12 +373,12 @@ cluster.force_flush()
 
 ## ⚡ Encryption Mode vs. Nitro Mode
 
-| Config | Cold Open (4.2GB) | Flush (small DB) | Security |
+| Config | Cold Open (~3.8GB, 8 shards, 1.0.5 parallel) | Flush (small DB) | Security |
 | :--- | :--- | :--- | :--- |
-| **Fort Knox** (58k PBKDF2 iter, floor enforced) | `~85.4 seconds` | `~43 ms` | Fully encrypted. Brute-force resistant. |
-| **⚡ Nitro Mode** (no encryption) | `~8.2 seconds` | `~8 ms` | Plaintext flatbuffer. Readable by anyone with a hex editor. |
+| **Fort Knox** (58k PBKDF2 iter, floor enforced) | `~17.6 seconds` | `~43 ms` | Fully encrypted. Brute-force resistant. |
+| **⚡ Nitro Mode** (no encryption) | `~2.4 seconds` | `~8 ms` | Plaintext flatbuffer. Readable by anyone with a hex editor. |
 
-The cold open gap is entirely **AES-256-CTR decrypting 4.2GB of ciphertext** on load — not PBKDF2. PBKDF2 at 10k+ iterations costs a few hundred milliseconds per shard. AES at 4.2GB costs everything else. Nitro Mode removes the AES pass entirely: 8.2 seconds is just raw SSD read speed plus FlatBuffers deserialization.
+The cold-open gap is **AES-256-CTR decrypting all the ciphertext** on load — not PBKDF2. PBKDF2 at 10k+ iterations costs a few hundred milliseconds per shard total. AES costs everything else. As of 1.0.5 both modes load shards in parallel, so wall-clock open ≈ time of the slowest shard rather than the sum.
 
 **Live migration** is a `SetEncryption()` call followed by a flush:
 
@@ -429,7 +468,7 @@ HyperDB is the **Workstation King**. Raw local ingestion throughput will smoke S
 | `QueueWriteBulk(table, rows)` | Bulk write to active shard. One manifest update for the whole batch. Handles spillover. |
 | `QueueRead(table, global_row_id, cb)` | Resolves global row ID via manifest, reads from correct shard. |
 | `QueueFind(table, col, value, cb, target)` | Fan-out find. Dispatches to all matching shards in parallel, merges on completion. |
-| `QueueDelete(table, col, value, target)` | Fan-out delete. Cascades row ID corrections via `ShiftManifestEntries`. |
+| `QueueDelete(table, col, value, target, callback=nullptr)` | Fan-out delete. Cascades row ID corrections via `ShiftManifestEntries`. Optional `callback(int)` fires once with the **summed** delete count after all shards have completed. |
 | `GetRowCount(table)` | Total rows across all shards. |
 | `GetShardCount()` | Number of open shard files. |
 | `GetActiveShard()` | Index of current write shard. |
@@ -476,6 +515,10 @@ HyperDB is the **Workstation King**. Raw local ingestion throughput will smoke S
 9. **Worker thread exceptions are caught.** If an `Exec*` call throws, the error is printed and the worker continues. The queue isn't dead. The shard isn't dead. The bad entry is silently eaten. This is a better outcome than a crashed process at 3AM, but you should still not throw from callbacks.
 
 10. **Thread safety model.** All `Exec*` methods run on the single dedicated worker thread per shard. `FlushDB` has its own `flush_mutex_`. `data_mutex_` covers the mirror during all exec operations. The cluster uses `manifest_mutex_` for all manifest and shard index operations. Do not call `Exec*` directly from outside the queue.
+
+11. **Atomic write, no fsync.** Disk writes (`.db` shards and the cluster `.manifest`) go through write-to-`<path>.tmp` followed by `std::filesystem::rename`. The rename is atomic on every supported OS, so a process crash mid-flush leaves you with either the previous good file or the new one — never a half-written file. HyperDB does **not** call `fsync` / `_commit` / `fdatasync` after the write. That means the OS may still hold the bytes in its page cache when the rename returns, and a hard power cut after the rename can lose the data. This is the same non-ACID tradeoff as note #1, just stated for the file layer specifically. If you need power-loss durability, run `sync` or call `FlushFileBuffers` from the calling code after `ForceFlush` returns.
+
+12. **Cluster `QueueDelete` callback semantics.** When you pass a callback to `HyperDBCluster::QueueDelete`, it fires **once**, after all targeted shards have finished their deletes, with the **summed** deleted count across shards. Per-shard callbacks are still used internally for `ShiftManifestEntries`. The aggregation is done with a `shared_ptr<atomic<int>>` pair so it's safe even when shard workers complete on different threads.
 
 <div align="center">
 <i>Maintained by someone deeply regretting their life choices.</i>
