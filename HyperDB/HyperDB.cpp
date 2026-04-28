@@ -11,19 +11,11 @@
 #include <pybind11/pybind11.h>
 #endif
 
-#include <cstdio>
 #include <future>
 #include <iostream>
 #include <json.hpp>
 #include <pbkdf2/pbkdf2-sha256.hpp>
 #include <tinyAES/aes.hpp>
-
-#ifdef _WIN32
-#include <io.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 namespace {
 // best-effort secure zero. compiler can't elide because of the volatile pointer.
@@ -36,25 +28,13 @@ inline void SecureZero(void *p, size_t n) noexcept {
 #endif
 }
 
-// flush an ofstream all the way to disk. close-then-fsync the underlying fd.
-inline void FlushToDisk(std::ofstream &f, const std::string &path) {
-  f.flush();
-  f.close();
-#ifdef _WIN32
-  FILE *fp = nullptr;
-  if (fopen_s(&fp, path.c_str(), "rb") == 0 && fp) {
-    int fd = _fileno(fp);
-    if (fd >= 0) _commit(fd);
-    fclose(fp);
-  }
-#else
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd >= 0) { ::fdatasync(fd); ::close(fd); }
-#endif
-}
-
-// write+rename for crash-safe file replacement. tmp gets fsync'd, then rename.
-// rename on the same filesystem is atomic on every OS we ship.
+// write to <path>.tmp then atomic-rename onto <path>. this prevents *partial-
+// file* corruption (the file you read is always whole — either old contents or
+// new contents, never mid-write garbage). this is NOT fsync and will NOT
+// survive a power cut: the OS may still hold the bytes in its page cache when
+// the rename completes. that's the explicit project tradeoff — see the
+// "Notes for the Brave" section of the README. fsync turned an 8-shard
+// finalize from 157ms into 8.4s in 1.0.4; we are not putting it back.
 inline void AtomicWriteFile(const std::string &path,
                             const uint8_t *data, size_t size) {
   std::string tmp = path + ".tmp";
@@ -64,7 +44,9 @@ inline void AtomicWriteFile(const std::string &path,
       throw std::runtime_error("HyperDB: failed to open " + tmp);
     f.write(reinterpret_cast<const char *>(data),
             static_cast<std::streamsize>(size));
-    FlushToDisk(f, tmp);
+    f.close();
+    if (!f)
+      throw std::runtime_error("HyperDB: failed to write " + tmp);
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
