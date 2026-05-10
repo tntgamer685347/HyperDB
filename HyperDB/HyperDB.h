@@ -362,7 +362,12 @@ private:
                     std::function<void(HyperDBManager &)> fn);
   void SaveManifest();
   void LoadManifest();
-  void SaveManifestInternal();
+  // force=true bypasses the rate limit. Use it from explicit user-driven
+  // operations (SetEncryption, ForceFlush, SaveManifest) where the manifest
+  // MUST reflect the new state on disk before we return — otherwise the
+  // next process opening this folder reads stale data and behaves wrong
+  // (e.g. tries to open encrypted shards as unencrypted).
+  void SaveManifestInternal(bool force = false);
   void MaybeSaveManifest(); // Throttled manifest save
   std::vector<int> GetShardIndicesInternal(ShardTarget target);
   void ShiftManifestEntries(const std::string &table_name, int from_shard_index,
@@ -387,4 +392,12 @@ private:
   std::chrono::steady_clock::time_point last_manifest_save_ =
       std::chrono::steady_clock::now();
   static constexpr int64_t MANIFEST_SAVE_INTERVAL_MS = 1000; // Max 1 save per second
+
+  // Destructor: flush a dirty manifest if the rate limit deferred the last
+  // save. Without this, a cluster that called SetEncryption shortly after
+  // construction (within MANIFEST_SAVE_INTERVAL_MS) loses the new
+  // should_encrypt state when it goes out of scope, leaving encrypted shards
+  // on disk with a manifest that says they're unencrypted.
+public:
+  ~HyperDBCluster();
 };

@@ -1721,7 +1721,7 @@ void HyperDBCluster::Flush(uint32_t iterations) {
   std::lock_guard<std::mutex> lock(manifest_mutex_);
   for (auto &shard : shards_)
     shard->FlushDB(iterations);
-  SaveManifestInternal();
+  SaveManifestInternal(/*force=*/true);
 }
 
 void HyperDBCluster::SetFlushInterval(int64_t ms) {
@@ -1733,7 +1733,9 @@ void HyperDBCluster::ForceFlush(uint32_t iterations) {
   std::lock_guard<std::mutex> lock(manifest_mutex_);
   for (auto &shard : shards_)
     shard->ForceFlush(iterations);
-  SaveManifestInternal();
+  // "Force" in the function name is a contract: the caller wants a guaranteed
+  // round-trip to disk. Bypass the manifest rate limit too.
+  SaveManifestInternal(/*force=*/true);
 }
 
 void HyperDBCluster::SetEncryption(bool encrypt, const std::string &password) {
@@ -1743,7 +1745,11 @@ void HyperDBCluster::SetEncryption(bool encrypt, const std::string &password) {
   for (auto &shard : shards_) {
     shard->SetEncryption(encrypt, password);
   }
-  SaveManifestInternal();
+  // force: the next Open() of this folder must see should_encrypt_ correctly.
+  // If the rate limit defers this save, the manifest stays at the OLD value
+  // and a subsequent Open with the wrong should_encrypt_ branch will fail
+  // verification (encrypted shards opened as unencrypted, or vice versa).
+  SaveManifestInternal(/*force=*/true);
 }
 
 bool HyperDBCluster::IsQueueEmpty() {
@@ -2038,16 +2044,36 @@ void HyperDBCluster::ForEachShard(ShardTarget target,
 
 void HyperDBCluster::SaveManifest() {
   std::lock_guard<std::mutex> lock(manifest_mutex_);
-  SaveManifestInternal();
+  // Public API; user explicitly asked to save -> bypass rate limit.
+  SaveManifestInternal(/*force=*/true);
 }
 
-void HyperDBCluster::SaveManifestInternal() {
+// Defined here so the in-class declaration doesn't drag <chrono>/<filesystem>
+// destructor codegen into every TU that includes HyperDB.h.
+HyperDBCluster::~HyperDBCluster() {
+  // Best-effort flush of a deferred manifest write. If the last user-driven
+  // operation hit the rate limit and only marked manifest_dirty_, the new
+  // state would be lost when this object dies. Wrap in try/catch because a
+  // dtor must never throw — if the disk is full or the path went away,
+  // there's nothing useful we can do at this point.
+  try {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    if (manifest_dirty_) SaveManifestInternal(/*force=*/true);
+  } catch (...) {
+    // swallow
+  }
+}
+
+void HyperDBCluster::SaveManifestInternal(bool force) {
   auto now = std::chrono::steady_clock::now();
   auto ms_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
       now - last_manifest_save_).count();
-  
-  // Always save if enough time has passed, otherwise just mark dirty
-  if (ms_since_last < MANIFEST_SAVE_INTERVAL_MS) {
+
+  // Rate limit only applies to opportunistic / high-frequency callers (e.g.
+  // ShiftManifestEntries on every row append). Explicit user operations like
+  // SetEncryption or ForceFlush pass force=true so the new state actually
+  // hits disk before they return.
+  if (!force && ms_since_last < MANIFEST_SAVE_INTERVAL_MS) {
     manifest_dirty_ = true;
     return;
   }
