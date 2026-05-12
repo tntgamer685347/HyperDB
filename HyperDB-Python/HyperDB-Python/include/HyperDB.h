@@ -242,6 +242,14 @@ public:
 
   const DatabaseMirror &GetMirror() const { return mirror_; }
 
+  // cheap state inspection — useful for diagnostics, tooling, the python
+  // browser, and your own desperate "wait, am i encrypted right now?" moments.
+  // these read mostly-immutable fields. no locks. don't call them from
+  // ten threads simultaneously while setencryption is also running and then
+  // act surprised when you get a weird value.
+  bool IsEncrypted() const noexcept { return should_encrypt_; }
+  const std::string &GetPath() const noexcept { return db_path_; }
+
   // exec methods - called by HyperDBQueue. public so the queue can reach them.
   // do not call these directly unless you enjoy data races at 3am.
   void ExecCreateDatabase(const std::string &name);
@@ -349,6 +357,52 @@ public:
   int GetRowCount(const std::string &table_name);
   int GetShardCount() const { return static_cast<int>(shards_.size()); }
   int GetActiveShard() const { return active_shard_index_; }
+
+  // state inspection. cheap reads of mostly-immutable fields. no locks.
+  // racy if you're calling setencryption from another thread, but at that
+  // point you have bigger problems.
+  bool IsEncrypted() const noexcept { return should_encrypt_; }
+  const std::string &GetFolder() const noexcept { return folder_; }
+  const std::string &GetName() const noexcept { return name_; }
+
+  // OR across every shard. takes the manifest lock because shards_ can grow
+  // during a spill and we'd rather not iterate over a vector that's being
+  // resized under our feet. ask me how i know.
+  bool IsDirty() {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    for (const auto &s : shards_)
+      if (s && s->IsDirty()) return true;
+    return false;
+  }
+
+  // sum across every shard. same lock, same reason.
+  size_t EstimateMirrorSize() {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    size_t total = 0;
+    for (const auto &s : shards_)
+      if (s) total += s->EstimateMirrorSize();
+    return total;
+  }
+
+  // read-only schema view. one entry per table created via QueueCreateTable.
+  // intended for introspection. don't mutate the returned reference or
+  // i can't be held responsible for what happens.
+  const std::unordered_map<std::string, std::vector<ColumnDef>> &
+  GetClusterSchemas() const noexcept { return cluster_schemas_; }
+
+  // read-only manifest view. tells you which shards own which row-id ranges
+  // per table. useful for "wait why is shard 3 huge" debugging.
+  const std::unordered_map<std::string, std::vector<ShardTableEntry>> &
+  GetManifestTables() const noexcept { return manifest_tables_; }
+
+  // direct shard access. bounds-checked. throws on bad index because
+  // crashing is rude.
+  HyperDBManager &GetShard(int index) {
+    std::lock_guard<std::mutex> lock(manifest_mutex_);
+    if (index < 0 || index >= static_cast<int>(shards_.size()))
+      throw std::out_of_range("HyperDB: shard index out of range");
+    return *shards_[index];
+  }
 
 private:
   std::string ShardPath(int index) const;
