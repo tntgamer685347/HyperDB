@@ -78,6 +78,20 @@ jobs:
         find "${{ github.workspace }}/build-base" -name "${{ matrix.lib_name }}" -exec cp {} "${{ github.workspace }}/HyperDB-Test/include/lib/" \;
         ls -la "${{ github.workspace }}/HyperDB-Test/include/lib/"
 
+    # the test project keeps its own copy of HyperDB.h next to main.cpp. if it
+    # drifts from HyperDB/HyperDB.h, the test exe and the lib disagree on the
+    # class layout and you get fun linker errors like LNK2005 on the cluster
+    # destructor (msvc /LTCG sees the implicit dtor in main.obj AND the
+    # explicit dtor from the lib and refuses to dedupe). copy it fresh so
+    # there's exactly one source of truth.
+    - name: Sync HyperDB.h into Test Tree
+      shell: bash
+      run: |
+        cp "${{ github.workspace }}/HyperDB/HyperDB.h" "${{ github.workspace }}/HyperDB-Test/HyperDB-Test/include/HyperDB.h"
+        cp "${{ github.workspace }}/HyperDB/include/hyperdb_generated.h" "${{ github.workspace }}/HyperDB-Test/HyperDB-Test/include/hyperdb_generated.h" 2>/dev/null || true
+        rm -rf "${{ github.workspace }}/HyperDB-Test/HyperDB-Test/include/flatbuffers"
+        cp -R "${{ github.workspace }}/HyperDB/include/flatbuffers" "${{ github.workspace }}/HyperDB-Test/HyperDB-Test/include/flatbuffers" 2>/dev/null || true
+
     - name: Build Test Executable
       shell: bash
       run: |
@@ -106,6 +120,17 @@ jobs:
         mkdir -p "${{ github.workspace }}/HyperDB-Python/include/lib"
         find "${{ github.workspace }}/build-pylib" -name "${{ matrix.lib_name }}" -exec cp {} "${{ github.workspace }}/HyperDB-Python/include/lib/" \;
         ls -la "${{ github.workspace }}/HyperDB-Python/include/lib/"
+
+    # same story as the test tree — the python bindings include their own copy
+    # of HyperDB.h. keep it in sync with the source of truth so the .pyd and
+    # the lib agree on what HyperDBCluster looks like.
+    - name: Sync HyperDB.h into Python Tree
+      shell: bash
+      run: |
+        cp "${{ github.workspace }}/HyperDB/HyperDB.h" "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/include/HyperDB.h"
+        cp "${{ github.workspace }}/HyperDB/include/hyperdb_generated.h" "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/include/hyperdb_generated.h" 2>/dev/null || true
+        rm -rf "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/include/flatbuffers"
+        cp -R "${{ github.workspace }}/HyperDB/include/flatbuffers" "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/include/flatbuffers" 2>/dev/null || true
 
     - name: Build Python Module
       shell: bash
