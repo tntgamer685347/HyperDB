@@ -83,11 +83,11 @@ static const char *ColumnTypeName(HyperDB::ColumnType t) {
 }
 
 PYBIND11_MODULE(HyperDB, m) {
-    m.doc() = "hyperdb python bindings v1.0.6 — now with mirror introspection, "
-              "bytes round-trip, explicit numeric factories, context managers, "
-              "and a proper exception type. existence is still suffering but "
-              "the api is at least slightly nicer about it.";
-    m.attr("__version__") = "1.0.6";
+    m.doc() = "hyperdb python bindings v1.0.7 — same as 1.0.6 except the "
+              "module actually imports now. ColumnType enum no longer pollutes "
+              "module scope and stomps on the value-constructor factories. "
+              "lesson learned. moving on.";
+    m.attr("__version__") = "1.0.7";
 
     // -----------------------------------------------------------------------
     // exception type. lets callers write `except HyperDB.Error:` instead of
@@ -109,6 +109,14 @@ PYBIND11_MODULE(HyperDB, m) {
     // -----------------------------------------------------------------------
     // enums - the only things that actually make sense in this codebase
     // -----------------------------------------------------------------------
+    // NOTE: no .export_values() here. it dumps every enum member at module
+    // scope (HyperDB.Int8, HyperDB.Bytes, HyperDB.String, ...) and that
+    // collides head-on with the explicit value-constructor factories below
+    // (HyperDB.Bytes(b"..."), HyperDB.I8(x), HyperDB.U32(x), ...). pybind11
+    // throws "Cannot overload existing non-function object" at import time
+    // and the whole module fails to load. been there. cried about it. use
+    // HyperDB.ColumnType.Bytes etc. — which is what every existing caller
+    // does anyway.
     py::enum_<HyperDB::ColumnType>(m, "ColumnType", "types of data we can actually store without the database exploding")
         .value("Int8", HyperDB::ColumnType_Int8)
         .value("Int16", HyperDB::ColumnType_Int16)
@@ -122,8 +130,7 @@ PYBIND11_MODULE(HyperDB, m) {
         .value("Float64", HyperDB::ColumnType_Float64)
         .value("Bool", HyperDB::ColumnType::ColumnType_Bool)
         .value("String", HyperDB::ColumnType::ColumnType_String)
-        .value("Bytes", HyperDB::ColumnType::ColumnType_Bytes)
-        .export_values();
+        .value("Bytes", HyperDB::ColumnType::ColumnType_Bytes);
 
     py::enum_<ShardTarget>(m, "ShardTarget", "which shards to hit. usually 'All' unless you're feeling adventurous")
         .value("All", ShardTarget::All)
