@@ -166,7 +166,15 @@ jobs:
         
         # Copy bindings source
         cp "${{ github.workspace }}/HyperDB-Python/HyperDB-Python/main.cpp" "artifacts/${{ matrix.platform }}/bindings.cpp"
-        
+
+        # Copy python utility scripts so a user can extract the zip and
+        # immediately run stress_test.py / browser.py / cli.py without needing
+        # to git-clone the repo. these are platform-agnostic; we ship the same
+        # copy in every platform's zip because life is too short.
+        cp "${{ github.workspace }}/HyperDB-Python/stress_test.py" "artifacts/${{ matrix.platform }}/stress_test.py"
+        cp "${{ github.workspace }}/HyperDB-Python/browser.py" "artifacts/${{ matrix.platform }}/browser.py"
+        cp "${{ github.workspace }}/HyperDB-Python/cli.py" "artifacts/${{ matrix.platform }}/cli.py"
+
         echo "=== Artifacts ==="
         ls -la "artifacts/${{ matrix.platform }}/"
 
@@ -216,12 +224,18 @@ jobs:
           - `HyperDB.pyd` - Python module
           - `HyperDB-Test.exe` - Test executable
           - `bindings.cpp` - Python bindings source
-          
+
           ### Linux (GCC & Clang)
           - `libHyperDB.a` - Static library for C++
           - `HyperDB.so` - Python module
           - `HyperDB-Test` - Test executable
           - `bindings.cpp` - Python bindings source
+
+          ### Python utility scripts (all platforms)
+          Drop these next to the built `HyperDB.pyd` / `HyperDB.so` and run them.
+          - `stress_test.py` - solo + cluster benchmark / smoke test (`python stress_test.py`)
+          - `browser.py` - Qt GUI database browser (`python browser.py`, requires PySide6: `pip install PySide6`)
+          - `cli.py` - terminal/ncurses database browser (`python cli.py`, Windows users: `pip install windows-curses`)
           
           ### C++ headers (all platforms)
           Add the zip root to your include path (e.g. `-I/path/to/extract`). The archive contains:

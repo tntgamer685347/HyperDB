@@ -83,11 +83,11 @@ static const char *ColumnTypeName(HyperDB::ColumnType t) {
 }
 
 PYBIND11_MODULE(HyperDB, m) {
-    m.doc() = "hyperdb python bindings v1.0.7 — same as 1.0.6 except the "
-              "module actually imports now. ColumnType enum no longer pollutes "
-              "module scope and stomps on the value-constructor factories. "
-              "lesson learned. moving on.";
-    m.attr("__version__") = "1.0.7";
+    m.doc() = "hyperdb python bindings v1.0.8 — same wiring as 1.0.7, but the "
+              "release zip now ships the python utility scripts (stress_test, "
+              "browser, cli) alongside the .pyd/.so so you can actually use "
+              "this thing without git-cloning the repo first.";
+    m.attr("__version__") = "1.0.8";
 
     // -----------------------------------------------------------------------
     // exception type. lets callers write `except HyperDB.Error:` instead of
