@@ -201,15 +201,20 @@ jobs:
     - name: Configure Toolchain
       shell: bash
       run: |
-        # manylinux ships several pythons under /opt/python/. Pick 3.11 and
-        # install cmake into that interpreter's bin so it's on PATH.
-        PYBIN=/opt/python/cp311-cp311/bin
-        "$PYBIN/python" -m pip install --upgrade pip
-        "$PYBIN/python" -m pip install cmake ninja pybind11
-        echo "$PYBIN" >> "$GITHUB_PATH"
-        echo "PYBIN=$PYBIN" >> "$GITHUB_ENV"
-        cmake --version
+        # We avoid the /opt/python/cpXXX installs that ship with the manylinux
+        # image because they're static-linked and have no libpython.so on
+        # disk — CMake's find_package(Python3 ... Development) needs both
+        # Development.Module AND Development.Embed, and the test exe genuinely
+        # links libpython (libHyperDB.a has pybind11 baked in). AlmaLinux 8
+        # ships python3.11 in AppStream with a proper libpython3.11.so.
+        dnf install -y python3.11 python3.11-devel
+        python3.11 -m pip install --upgrade pip
+        python3.11 -m pip install cmake ninja pybind11
+        echo "PYBIN=/usr/bin/python3.11" >> "$GITHUB_ENV"
+        which cmake && cmake --version
         gcc --version
+        python3.11 --version
+        ls /usr/lib64/libpython3.11* || true
 
     - name: Build Base Library
       shell: bash
@@ -219,7 +224,7 @@ jobs:
           -DCMAKE_C_COMPILER=gcc \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -DPython3_EXECUTABLE="$PYBIN" \
           -S "$GITHUB_WORKSPACE"
         cmake --build build-base --config Release --target HyperDB --parallel
 
@@ -245,7 +250,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=g++ \
           -DCMAKE_C_COMPILER=gcc \
           -DCMAKE_BUILD_TYPE=Release \
-          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -DPython3_EXECUTABLE="$PYBIN" \
           -S "$GITHUB_WORKSPACE/HyperDB-Test"
         cmake --build build-test --config Release --parallel
 
@@ -258,7 +263,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
           -DBUILD_PYTHON_MODULE=ON \
-          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -DPython3_EXECUTABLE="$PYBIN" \
           -S "$GITHUB_WORKSPACE"
         cmake --build build-pylib --config Release --target HyperDB --parallel
 
@@ -284,7 +289,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=g++ \
           -DCMAKE_C_COMPILER=gcc \
           -DCMAKE_BUILD_TYPE=Release \
-          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -DPython3_EXECUTABLE="$PYBIN" \
           -S "$GITHUB_WORKSPACE/HyperDB-Python"
         cmake --build build-pymod --config Release --parallel
 
