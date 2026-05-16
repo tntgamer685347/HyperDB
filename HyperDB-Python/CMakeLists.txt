@@ -67,6 +67,13 @@ find_package(Python3 REQUIRED COMPONENTS Development)
 target_include_directories(HyperDB PRIVATE ${Python3_INCLUDE_DIRS})
 target_link_libraries(HyperDB PRIVATE ${Python3_LIBRARIES})
 
+# pthread is pulled in transitively by libHyperDB.a (HyperDBManager spawns
+# threads). Ubuntu's linker auto-resolves the DSO; AlmaLinux 8 + gcc-toolset's
+# binutils does not and errors with "DSO missing from command line". Link
+# Threads::Threads explicitly so the manylinux build links.
+find_package(Threads REQUIRED)
+target_link_libraries(HyperDB PRIVATE Threads::Threads)
+
 # ---------------------------------------------------------------------------
 # Compiler definitions
 # ---------------------------------------------------------------------------
