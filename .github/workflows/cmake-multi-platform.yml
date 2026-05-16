@@ -185,8 +185,167 @@ jobs:
         path: artifacts/${{ matrix.platform }}/
         retention-days: 7
 
+  # Separate Linux build inside a manylinux_2_28 container (GLIBC 2.28, GCC 14).
+  # The standard ubuntu-latest runner produces a .so that requires GLIBC 2.38+,
+  # which breaks on hosts pinned to older Ubuntu LTS (e.g. PythonAnywhere on
+  # 22.04 / GLIBC 2.35). Building against GLIBC 2.28 works everywhere from
+  # RHEL 8 / Ubuntu 20.04 onward. Python 3.11 picked to match the Windows build.
+  build-linux-manylinux:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure Toolchain
+      shell: bash
+      run: |
+        # manylinux ships several pythons under /opt/python/. Pick 3.11 and
+        # install cmake into that interpreter's bin so it's on PATH.
+        PYBIN=/opt/python/cp311-cp311/bin
+        "$PYBIN/python" -m pip install --upgrade pip
+        "$PYBIN/python" -m pip install cmake ninja pybind11
+        echo "$PYBIN" >> "$GITHUB_PATH"
+        echo "PYBIN=$PYBIN" >> "$GITHUB_ENV"
+        cmake --version
+        gcc --version
+
+    - name: Build Base Library
+      shell: bash
+      run: |
+        cmake -B build-base \
+          -DCMAKE_CXX_COMPILER=g++ \
+          -DCMAKE_C_COMPILER=gcc \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -S "$GITHUB_WORKSPACE"
+        cmake --build build-base --config Release --target HyperDB --parallel
+
+    - name: Copy Library to Test Dir
+      shell: bash
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/HyperDB-Test/include/lib"
+        find "$GITHUB_WORKSPACE/build-base" -name "libHyperDB.a" -exec cp {} "$GITHUB_WORKSPACE/HyperDB-Test/include/lib/" \;
+        ls -la "$GITHUB_WORKSPACE/HyperDB-Test/include/lib/"
+
+    - name: Sync HyperDB.h into Test Tree
+      shell: bash
+      run: |
+        cp "$GITHUB_WORKSPACE/HyperDB/HyperDB.h" "$GITHUB_WORKSPACE/HyperDB-Test/HyperDB-Test/include/HyperDB.h"
+        cp "$GITHUB_WORKSPACE/HyperDB/include/hyperdb_generated.h" "$GITHUB_WORKSPACE/HyperDB-Test/HyperDB-Test/include/hyperdb_generated.h" 2>/dev/null || true
+        rm -rf "$GITHUB_WORKSPACE/HyperDB-Test/HyperDB-Test/include/flatbuffers"
+        cp -R "$GITHUB_WORKSPACE/HyperDB/include/flatbuffers" "$GITHUB_WORKSPACE/HyperDB-Test/HyperDB-Test/include/flatbuffers" 2>/dev/null || true
+
+    - name: Build Test Executable
+      shell: bash
+      run: |
+        cmake -B build-test \
+          -DCMAKE_CXX_COMPILER=g++ \
+          -DCMAKE_C_COMPILER=gcc \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -S "$GITHUB_WORKSPACE/HyperDB-Test"
+        cmake --build build-test --config Release --parallel
+
+    - name: Build Python Library
+      shell: bash
+      run: |
+        cmake -B build-pylib \
+          -DCMAKE_CXX_COMPILER=g++ \
+          -DCMAKE_C_COMPILER=gcc \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DBUILD_PYTHON_MODULE=ON \
+          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -S "$GITHUB_WORKSPACE"
+        cmake --build build-pylib --config Release --target HyperDB --parallel
+
+    - name: Copy Library to Python Dir
+      shell: bash
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/HyperDB-Python/include/lib"
+        find "$GITHUB_WORKSPACE/build-pylib" -name "libHyperDB.a" -exec cp {} "$GITHUB_WORKSPACE/HyperDB-Python/include/lib/" \;
+        ls -la "$GITHUB_WORKSPACE/HyperDB-Python/include/lib/"
+
+    - name: Sync HyperDB.h into Python Tree
+      shell: bash
+      run: |
+        cp "$GITHUB_WORKSPACE/HyperDB/HyperDB.h" "$GITHUB_WORKSPACE/HyperDB-Python/HyperDB-Python/include/HyperDB.h"
+        cp "$GITHUB_WORKSPACE/HyperDB/include/hyperdb_generated.h" "$GITHUB_WORKSPACE/HyperDB-Python/HyperDB-Python/include/hyperdb_generated.h" 2>/dev/null || true
+        rm -rf "$GITHUB_WORKSPACE/HyperDB-Python/HyperDB-Python/include/flatbuffers"
+        cp -R "$GITHUB_WORKSPACE/HyperDB/include/flatbuffers" "$GITHUB_WORKSPACE/HyperDB-Python/HyperDB-Python/include/flatbuffers" 2>/dev/null || true
+
+    - name: Build Python Module
+      shell: bash
+      run: |
+        cmake -B build-pymod \
+          -DCMAKE_CXX_COMPILER=g++ \
+          -DCMAKE_C_COMPILER=gcc \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DPython3_EXECUTABLE="$PYBIN/python" \
+          -S "$GITHUB_WORKSPACE/HyperDB-Python"
+        cmake --build build-pymod --config Release --parallel
+
+    - name: Verify GLIBC requirement
+      shell: bash
+      run: |
+        SO=$(find "$GITHUB_WORKSPACE/build-pymod" -name "HyperDB.so" | head -n1)
+        echo "Inspecting: $SO"
+        # Highest GLIBC version referenced by the .so. If this prints anything
+        # > 2.28 the build leaked into a newer libc symbol and won't run on
+        # PythonAnywhere — fail loudly so we catch it in CI instead of prod.
+        MAX=$(objdump -T "$SO" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -n1 || echo "GLIBC_none")
+        echo "Highest GLIBC symbol: $MAX"
+        if [ "$MAX" != "GLIBC_none" ]; then
+          ver=${MAX#GLIBC_}
+          awk -v v="$ver" 'BEGIN { split(v,a,"."); if (a[1]>2 || (a[1]==2 && a[2]>28)) exit 1 }' \
+            || { echo "ERROR: .so requires $MAX, exceeds GLIBC_2.28 ceiling"; exit 1; }
+        fi
+
+    - name: Package Artifacts
+      shell: bash
+      run: |
+        OUT="artifacts/linux-gcc-manylinux_2_28"
+        mkdir -p "$OUT"
+
+        # Base library
+        find "$GITHUB_WORKSPACE/build-base" -name "libHyperDB.a" -exec cp {} "$OUT/" \;
+
+        # Headers
+        cp "$GITHUB_WORKSPACE/HyperDB/HyperDB.h" "$OUT/"
+        cp "$GITHUB_WORKSPACE/HyperDB/include/hyperdb_generated.h" "$OUT/"
+        mkdir -p "$OUT/flatbuffers"
+        cp -R "$GITHUB_WORKSPACE/HyperDB/include/flatbuffers/." "$OUT/flatbuffers/"
+
+        # Test executable
+        find "$GITHUB_WORKSPACE/build-test" -name "HyperDB-Test" -exec cp {} "$OUT/" \;
+        chmod +x "$OUT/HyperDB-Test" 2>/dev/null || true
+
+        # Python module
+        find "$GITHUB_WORKSPACE/build-pymod" -name "HyperDB.so" -exec cp {} "$OUT/" \;
+
+        # Bindings source
+        cp "$GITHUB_WORKSPACE/HyperDB-Python/HyperDB-Python/main.cpp" "$OUT/bindings.cpp"
+
+        # Utility scripts
+        cp "$GITHUB_WORKSPACE/HyperDB-Python/stress_test.py" "$OUT/stress_test.py"
+        cp "$GITHUB_WORKSPACE/HyperDB-Python/browser.py" "$OUT/browser.py"
+        cp "$GITHUB_WORKSPACE/HyperDB-Python/cli.py" "$OUT/cli.py"
+
+        echo "=== Artifacts ==="
+        ls -la "$OUT/"
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: hyperdb-linux-gcc-manylinux_2_28
+        path: artifacts/linux-gcc-manylinux_2_28/
+        retention-days: 7
+
   release:
-    needs: build
+    needs: [build, build-linux-manylinux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     
@@ -228,6 +387,16 @@ jobs:
           ### Linux (GCC & Clang)
           - `libHyperDB.a` - Static library for C++
           - `HyperDB.so` - Python module
+          - `HyperDB-Test` - Test executable
+          - `bindings.cpp` - Python bindings source
+
+          ### Linux (manylinux_2_28, GLIBC 2.28, Python 3.11)
+          Drop-in replacement for the standard Linux build when your host runs
+          an older glibc. Tested target: PythonAnywhere (Ubuntu 22.04, GLIBC
+          2.35). Use this zip if `import HyperDB` fails with
+          `version 'GLIBC_2.XX' not found`.
+          - `libHyperDB.a` - Static library for C++
+          - `HyperDB.so` - Python module (built against Python 3.11)
           - `HyperDB-Test` - Test executable
           - `bindings.cpp` - Python bindings source
 
