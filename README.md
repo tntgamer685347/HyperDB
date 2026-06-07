@@ -26,6 +26,17 @@ If you are looking for an ACID compliant, highly scalable, enterprise-grade clou
 
 ---
 
+## 🆕 What's new in 1.0.12
+
+An optimization update focused on query acceleration, concurrency throughput, and robust floating-point comparisons:
+
+- **Lazy Secondary Indexing:** O(1) repeated query speedups. HyperDB now lazily constructs secondary hash-indexes (`std::unordered_map`) for columns when they are first queried (excluding float types). Future lookups/finds on that column leverage the index, shifting search time from a linear O(N) scan to an O(1) lookup.
+- **Double-Buffered Queue Worker:** The background task processing queue now uses a double-buffering swap mechanism. When waking up, the worker thread swaps the global queue with a local queue under a brief lock acquisition and releases the lock immediately. This prevents long-running flushes or serialization tasks from blocking client threads submitting new queries or writes.
+- **Relative Epsilon Float Comparisons:** Float scans in `ExecFind` and `ExecDelete` now use a relative epsilon margin (`std::fabs(a - b) <= 1e-6 * std::max({1.0, std::fabs(a), std::fabs(b)})`). This protects against floating-point rounding precision issues that would otherwise skip valid matches.
+- **Zero-Allocation RowData Evaluation:** Implemented and thoroughly profiled a global string-pooling mechanism (`StringPool`) for `RowData` column names to achieve zero-allocation rows. However, profiling revealed high mutex contention under high concurrency, so column names were reverted back to standard `std::string` to maintain peak multi-threaded throughput.
+
+---
+
 ## 🆕 What's new in 1.0.5
 
 A perf + correctness pass with measurable wins on the standard 10M-row stress (numbers below):
@@ -47,6 +58,8 @@ The full delta is a single commit on `main`. The previous numbers in this README
 
 ## 🔥 Features that justify the technical debt
 
+- **Lazy Secondary Indexing**: When columns are first searched, HyperDB lazily builds secondary hash-indexes (`std::unordered_map`). Subsequent repeated lookups on that column execute in **O(1)** time rather than doing a full linear scan.
+- **Double-Buffered Queue**: The worker thread swaps the main queue with a thread-local queue under a brief lock, then drops the lock to process tasks. Client threads can queue new operations without blocking during long flushes or serializations.
 - **Zero-Variant Scan Loop**: `ExecFind` and `ExecDelete` never box values into `HyperValue` during the hot scan pass. Typed raw pointers only. The compiler can autovectorize the integer branches. It does.
 - **Two-Pass Find**: Collect matching row indices first (one column, cache-friendly, vectorizable), then build `ReadResult` rows only for hits. If matches << rows — which is the entire point — this wins dramatically.
 - **Persistent Condition Variable Queue**: The worker thread sleeps on a `std::condition_variable`. No spinning. No wasted cycles. `AddToQueueBulk` drops N entries in a single lock acquisition and fires one `notify_one`.
