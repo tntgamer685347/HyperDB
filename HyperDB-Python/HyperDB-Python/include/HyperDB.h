@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+#include <unordered_set>
+#include <string_view>
 
 // yes, you need these for HyperDB, im sorry. (flatbuffers.lib is inside the
 // HyperDB.lib so you only need the headers.)
@@ -53,6 +55,20 @@ inline void SecureRandomBytes(uint8_t *buf, size_t len) {
 #endif
 }
 
+namespace HyperDBConstants {
+  constexpr uint32_t DEFAULT_PBKDF2_ITERATIONS = 58253;
+}
+
+struct StringPool {
+  static std::string_view Intern(const std::string &str) {
+    static std::unordered_set<std::string> pool;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto [it, inserted] = pool.insert(str);
+    return *it;
+  }
+};
+
 using HyperValue = std::variant<int8_t,              // ColumnType::Int8
                                 int16_t,             // ColumnType::Int16
                                 int32_t,             // ColumnType::Int32
@@ -68,6 +84,25 @@ using HyperValue = std::variant<int8_t,              // ColumnType::Int8
                                 std::vector<uint8_t> // ColumnType::Bytes
                                 >;
 
+struct HyperValueHash {
+  size_t operator()(const HyperValue &val) const {
+    return std::visit(
+        [](auto &&arg) -> size_t {
+          using T = std::decay_t<decltype(arg)>;
+          if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+            size_t h = 0;
+            for (auto x : arg) {
+              h ^= std::hash<uint8_t>{}(x) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            return h;
+          } else {
+            return std::hash<T>{}(arg);
+          }
+        },
+        val);
+  }
+};
+
 enum class ShardTarget : uint8_t {
   All,        // every shard (default)
   ActiveOnly, // only the current write shard
@@ -80,8 +115,14 @@ struct ColumnDef {
 };
 
 struct RowData {
-  std::string column_name;
+  std::string_view column_name;
   HyperValue value;
+
+  RowData() = default;
+  RowData(std::string_view name) : column_name(StringPool::Intern(std::string(name))), value(int8_t(0)) {}
+  RowData(std::string_view name, HyperValue val) : column_name(StringPool::Intern(std::string(name))), value(val) {}
+  RowData(const std::string &name, HyperValue val) : column_name(StringPool::Intern(name)), value(val) {}
+  RowData(const char *name, HyperValue val) : column_name(StringPool::Intern(name)), value(val) {}
 };
 
 using ReadResult = std::vector<RowData>;
@@ -161,6 +202,7 @@ struct TableMirror {
   std::vector<ColumnMirror> columns;
   std::unordered_map<std::string, size_t> column_map;
   uint64_t row_count = 0;
+  std::unordered_map<std::string, std::unordered_map<HyperValue, std::vector<uint64_t>, HyperValueHash>> indexes;
 };
 
 struct DatabaseMirror {
@@ -208,10 +250,10 @@ public:
   void SetEncryption(bool encrypt, const std::string &password = "");
 
   // flush dirty mirror to disk. no-op if not dirty or interval hasn't elapsed.
-  void FlushDB(uint32_t iterations = 58253);
+  void FlushDB(uint32_t iterations = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS);
 
   void SetFlushInterval(int64_t ms);
-  void ForceFlush(uint32_t iterations = 58253);
+  void ForceFlush(uint32_t iterations = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS);
 
   // async queue operations — fire and forget (except Read/Find which use
   // callbacks)
@@ -277,6 +319,8 @@ private:
   ColumnMirror *FindColumn(TableMirror &table, const std::string &name);
   HyperValue GetValueAtIndex(const ColumnMirror &col, uint64_t idx);
   HyperValue GetDefaultValue(HyperDB::ColumnType type);
+  void RebuildIndexes(TableMirror &table);
+  void UpdateIndexesOnWrite(TableMirror &table, uint64_t start_idx, uint64_t end_idx);
 
   // flatbuffer ser/deser. magic. do not touch.
   flatbuffers::Offset<HyperDB::Database>
@@ -322,9 +366,9 @@ public:
             size_t shard_limit_bytes = DEFAULT_SHARD_LIMIT,
             bool encrypt = true);
 
-  void Flush(uint32_t iterations = 58253);
+  void Flush(uint32_t iterations = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS);
   void SetFlushInterval(int64_t ms);
-  void ForceFlush(uint32_t iterations = 58253);
+  void ForceFlush(uint32_t iterations = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS);
   void SetEncryption(bool encrypt, const std::string &password = "");
   bool IsQueueEmpty();
 

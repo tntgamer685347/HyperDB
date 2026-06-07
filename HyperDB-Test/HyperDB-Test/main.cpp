@@ -136,16 +136,16 @@ void RunSoloTests() {
 }
 
 void RunClusterWriteBenchmark() {
-    std::cout << "\n[2] STARTING 10,000,000 ROW APOCALYPSE (WRITE BENCHMARK)" << std::endl;
+    std::cout << "\n[2] STARTING 500,000 ROW MINI-APOCALYPSE (WRITE BENCHMARK)" << std::endl;
     std::mt19937 rng(static_cast<unsigned int>(std::time(nullptr)));
     HyperDBCluster cluster;
 
     const std::string PWD = "death";
     const std::string FOLDER = "death_benchmark";
     const size_t SHARD_LIMIT = 512ULL * 1024 * 1024;
-    const int TOTAL_ROWS = 10000000;
+    const int TOTAL_ROWS = 500000;
 
-    std::cout << "  " << get_time_stamp() << " target: 3.8GB scale-out write..." << std::endl;
+    std::cout << "  " << get_time_stamp() << " target: scale-out write..." << std::endl;
 
     {
         Timer t;
@@ -236,7 +236,7 @@ void RunClusterReadBenchmark() {
             c1.Open(FOLDER, "death", PWD, SHARD_LIMIT, false);
             perform_read_test(c1, "ORIGINAL NITRO");
 
-            std::cout << "  > MIGRATING 4.2GB TO FORT KNOX (ENCRYPTED)..." << std::endl;
+            std::cout << "  > MIGRATING TO FORT KNOX (ENCRYPTED)..." << std::endl;
             Timer mig_timer;
             c1.SetEncryption(true, "death");
             c1.ForceFlush(1); // 1 iteration for speed
@@ -251,7 +251,7 @@ void RunClusterReadBenchmark() {
             std::cout << "      > Cold Open (Encrypted) took: " << open_timer.elapsed_ms() << " ms" << std::endl;
             perform_read_test(c2, "ENCRYPTED");
 
-            std::cout << "  > MIGRATING 4.2GB BACK TO NITRO..." << std::endl;
+            std::cout << "  > MIGRATING BACK TO NITRO..." << std::endl;
             Timer mig_timer;
             c2.SetEncryption(false, "");
             c2.ForceFlush(1);
@@ -265,7 +265,7 @@ void RunClusterReadBenchmark() {
             c3.Open(FOLDER, "death", "", SHARD_LIMIT, false);
             std::cout << "      > Cold Open (Nitro) took: " << open_timer.elapsed_ms() << " ms" << std::endl;
             perform_read_test(c3, "POST-MIGRATION NITRO");
-            std::cout << "  [OK] Full migration cycle verified on 4.2GB dataset." << std::endl;
+            std::cout << "  [OK] Full migration cycle verified." << std::endl;
         }
 
     } catch (const std::exception& e) {

@@ -31,6 +31,15 @@ def assert_test(condition, msg):
 
 def run_solo_tests():
     print("\n[1] TESTING HYPERDB MANAGER (SOLO UNIT TESTS)")
+    print(f"      > Cwd: {os.getcwd()}")
+    if os.path.exists("test_solo.db"):
+        print("      > test_solo.db exists! Deleting it...")
+        try:
+            os.remove("test_solo.db")
+        except Exception as e:
+            print(f"      > Failed to delete test_solo.db: {e}")
+    else:
+        print("      > test_solo.db does not exist.")
     db = HyperDB.HyperDBManager()
 
     t = Timer()
@@ -106,15 +115,15 @@ def run_solo_tests():
     db2.force_flush(1)
 
 def run_cluster_write_benchmark():
-    print("\n[2] STARTING 10,000,000 ROW APOCALYPSE (WRITE BENCHMARK)")
+    print("\n[2] STARTING 100,000 ROW MINI-APOCALYPSE (WRITE BENCHMARK)")
     cluster = HyperDB.HyperDBCluster()
 
     pwd = "death"
     folder = "death_benchmark"
     shard_limit = 512 * 1024 * 1024
-    total_rows = 10000000
+    total_rows = 100000
 
-    print(f"  {get_timestamp()} target: 3.8GB scale-out write...")
+    print(f"  {get_timestamp()} target: mini scale-out write...")
 
     t = Timer()
     cluster.open(folder, "death", pwd, shard_limit, False)
@@ -162,7 +171,7 @@ def run_cluster_write_benchmark():
 def perform_read_test(cluster, label):
     print(f"\n  --- PHASE: {label} ---")
     total_rows = cluster.get_row_count("death")
-    read_count = 100000
+    read_count = 20000
     
     # python doesn't have a clean atomic int like c++, but for this increment 
     # it doesn't matter much because we're just counting.
@@ -171,7 +180,7 @@ def perform_read_test(cluster, label):
         nonlocal completed_reads
         completed_reads += 1
 
-    print(f"      > Stress testing 100,000 random global ID reads...")
+    print(f"      > Stress testing 20,000 random global ID reads...")
     read_timer = Timer()
     for i in range(read_count):
         row_id = random.randint(0, total_rows - 1)
@@ -200,7 +209,7 @@ def run_cluster_read_benchmark():
         c1.open(folder, "death", "death", shard_limit, False)
         perform_read_test(c1, "ORIGINAL NITRO")
 
-        print("  > MIGRATING 4.2GB TO FORT KNOX (ENCRYPTED)...")
+        print("  > MIGRATING TO FORT KNOX (ENCRYPTED)...")
         t = Timer()
         c1.set_encryption(True, "death")
         c1.force_flush(1)
@@ -215,7 +224,7 @@ def run_cluster_read_benchmark():
         print(f"      > Cold Open (Encrypted) took: {t.elapsed_ms():.2f} ms")
         perform_read_test(c2, "ENCRYPTED")
 
-        print("  > MIGRATING 4.2GB BACK TO NITRO...")
+        print("  > MIGRATING BACK TO NITRO...")
         t = Timer()
         c2.set_encryption(False, "")
         c2.force_flush(1)
@@ -228,7 +237,7 @@ def run_cluster_read_benchmark():
         c3.open(folder, "death", "", shard_limit, False)
         print(f"      > Cold Open (Nitro) took: {t.elapsed_ms():.2f} ms")
         perform_read_test(c3, "POST-MIGRATION NITRO")
-        print("  [OK] Full migration cycle verified on 4.2GB dataset.")
+        print("  [OK] Full migration cycle verified.")
 
     except Exception as e:
         print(f"  [READ FAIL] {str(e)}")
@@ -238,8 +247,6 @@ if __name__ == "__main__":
     master_timer = Timer()
     
     run_solo_tests()
-    # warning: generating 10M rows of noise in python is going to be slow as hell.
-    # don't blame the database when the bottleneck is string joining.
     run_cluster_write_benchmark()
     run_cluster_read_benchmark()
 

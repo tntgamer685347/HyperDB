@@ -123,36 +123,32 @@ bool HyperDBQueue::IsEmpty() { return queue_size_ == 0 && !worker_busy_; }
 
 void HyperDBQueue::ProcessQueue() {
   while (!stop_worker_) {
-    QueueEntry entry;
-    bool has_entry = false;
-    bool is_callback_action = false;
-
+    std::queue<QueueEntry> local_queue;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait(lock, [this] { return !queue_.empty() || stop_worker_; });
 
-      if (stop_worker_)
+      if (stop_worker_ && queue_.empty())
         return;
 
       if (!queue_.empty()) {
-        entry = std::move(queue_.front());
-        queue_.pop();
+        std::swap(queue_, local_queue);
         worker_busy_ = true;
-        queue_size_--;
-        has_entry = true;
-        auto t = entry.action;
-        // delete also fires a user callback now, so it needs the gil too.
-        is_callback_action =
-            (t == QueueActionType::Read || t == QueueActionType::Find ||
-             t == QueueActionType::Delete);
+        queue_size_ = 0;
       }
     }
 
-    if (has_entry) {
+    while (!local_queue.empty()) {
+      QueueEntry entry = std::move(local_queue.front());
+      local_queue.pop();
+      auto t = entry.action;
+      bool is_callback_action =
+          (t == QueueActionType::Read || t == QueueActionType::Find ||
+           t == QueueActionType::Delete);
+
       try {
 #ifdef BUILD_PYTHON_MODULE
         if (is_callback_action) {
-          // gil_scoped_acquire will crash if not used by actual python.
           pybind11::gil_scoped_acquire acquire;
           Execute(std::move(entry));
         } else {
@@ -163,14 +159,11 @@ void HyperDBQueue::ProcessQueue() {
         Execute(std::move(entry));
 #endif
       } catch (const std::exception &e) {
-        // if we crash here, the worker thread would die and take the shard
-        // with it. we choose life. cerr is line-buffered — won't get sliced
-        // by other writers like printf can.
         std::cerr << "HYPERDB CRITICAL: Worker thread exception: " << e.what()
                   << std::endl;
       }
-      worker_busy_ = false;
     }
+    worker_busy_ = false;
   }
 }
 
@@ -564,6 +557,7 @@ void HyperDBManager::ExecClearTable(const std::string &table_name) {
     col.strings.clear(); col.bytes.clear();
   }
   table->row_count = 0;
+  table->indexes.clear();
   dirty_ = true;
 }
 
@@ -608,6 +602,7 @@ void HyperDBManager::ExecClearColumn(const std::string &table_name,
   col->bools.clear();
   col->strings.clear();
   col->bytes.clear();
+  table->indexes.clear();
   dirty_ = true;
 }
 
@@ -619,7 +614,7 @@ void HyperDBManager::ExecWrite(const std::string &table_name,
     return;
 
   for (auto &rd : row) {
-    auto it = table->column_map.find(rd.column_name);
+    auto it = table->column_map.find(std::string(rd.column_name));
     if (it == table->column_map.end())
       continue;
 
@@ -773,6 +768,7 @@ void HyperDBManager::ExecWrite(const std::string &table_name,
   }
 
   table->row_count++;
+  table->indexes.clear();
   dirty_ = true;
 }
 
@@ -819,7 +815,7 @@ void HyperDBManager::ExecWriteBulk(const std::string &table_name,
     std::fill(written.begin(), written.end(), 0);
 
     for (const auto &rd : row) {
-      auto it = table->column_map.find(rd.column_name);
+      auto it = table->column_map.find(std::string(rd.column_name));
       if (it == table->column_map.end())
         continue;
 
@@ -908,7 +904,9 @@ void HyperDBManager::ExecWriteBulk(const std::string &table_name,
     }
   }
 
+  uint64_t old_row_count = target_total - batch_size;
   table->row_count = target_total;
+  table->indexes.clear();
   estimated_size_ += size_accum;
   dirty_ = true;
 }
@@ -967,109 +965,144 @@ void HyperDBManager::ExecFind(
             ? HyperDBUtil::HyperValueToString(val)
             : std::string{};
 
-    // matching row indices. we collect indices first, build ReadResults after. (FANCY!)
-    // avoids re-locking or touching other columns during the hot scan.
     std::vector<uint64_t> hits;
-    hits.reserve(64); // pray that's enough. it usually is. (had to upgrade from 16 to 64) - i should probably make the reservations dynamic with an argument. yes i mean you, future me.
 
-    // dispatch once on type, then raw typed scan — zero variant overhead in the loop
-    switch (col->type) { // big boi
-    case HyperDB::ColumnType::ColumnType_Int8: {
-      auto n = static_cast<int8_t>(needle_i64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->i8[i] == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Int16: {
-      auto n = static_cast<int16_t>(needle_i64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->i16[i] == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Int32: {
-      auto n = static_cast<int32_t>(needle_i64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->i32[i] == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Int64: {
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->i64[i] == needle_i64)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_UInt8: {
-      auto n = static_cast<uint8_t>(needle_u64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->u8[i] == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_UInt16: {
-      auto n = static_cast<uint16_t>(needle_u64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->u16[i] == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_UInt32: {
-      auto n = static_cast<uint32_t>(needle_u64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->u32[i] == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_UInt64: {
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->u64[i] == needle_u64)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Float32: {
-      // ABSOLUTE epsilon, not relative. for floats around 1e10 this is
-      // effectively bit-exact equality; for floats around 1e-10 everything
-      // matches. if you need magnitude-aware comparisons, scan the column
-      // yourself with QueueRead and apply your own predicate.
-      auto n = static_cast<float>(needle_f64);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (std::fabs(col->f32[i] - n) < 1e-6f)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Float64: {
-      // see comment in Float32 — same absolute epsilon caveats apply here.
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (std::fabs(col->f64[i] - needle_f64) < 1e-6)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Bool: {
-      bool n = (needle_i64 != 0);
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if ((col->bools[i] != 0) == n)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_String: {
-      for (uint64_t i = 0; i < table->row_count; ++i)
-        if (col->strings[i] == needle_str)
-          hits.push_back(i);
-      break;
-    }
-    case HyperDB::ColumnType::ColumnType_Bytes: {
-      if (std::holds_alternative<std::vector<uint8_t>>(val)) {
-          auto& n = std::get<std::vector<uint8_t>>(val);
-          for (uint64_t i = 0; i < table->row_count; ++i)
-            if (col->bytes[i] == n)
-              hits.push_back(i);
+    bool use_index = false;
+    if (col->type != HyperDB::ColumnType::ColumnType_Float32 &&
+        col->type != HyperDB::ColumnType::ColumnType_Float64) {
+      use_index = true;
+      auto &col_idx = table->indexes[col_name];
+      if (col_idx.empty() && table->row_count > 0) {
+        for (uint64_t i = 0; i < table->row_count; ++i) {
+          col_idx[GetValueAtIndex(*col, i)].push_back(i);
+        }
       }
-      break;
     }
-    default:
-      break;
+
+    if (use_index) {
+      HyperValue lookup_val;
+      switch (col->type) {
+      case HyperDB::ColumnType::ColumnType_Int8:    lookup_val = static_cast<int8_t>(needle_i64); break;
+      case HyperDB::ColumnType::ColumnType_Int16:   lookup_val = static_cast<int16_t>(needle_i64); break;
+      case HyperDB::ColumnType::ColumnType_Int32:   lookup_val = static_cast<int32_t>(needle_i64); break;
+      case HyperDB::ColumnType::ColumnType_Int64:   lookup_val = needle_i64; break;
+      case HyperDB::ColumnType::ColumnType_UInt8:   lookup_val = static_cast<uint8_t>(needle_u64); break;
+      case HyperDB::ColumnType::ColumnType_UInt16:  lookup_val = static_cast<uint16_t>(needle_u64); break;
+      case HyperDB::ColumnType::ColumnType_UInt32:  lookup_val = static_cast<uint32_t>(needle_u64); break;
+      case HyperDB::ColumnType::ColumnType_UInt64:  lookup_val = needle_u64; break;
+      case HyperDB::ColumnType::ColumnType_Bool:    lookup_val = (needle_i64 != 0); break;
+      case HyperDB::ColumnType::ColumnType_String:  lookup_val = needle_str; break;
+      case HyperDB::ColumnType::ColumnType_Bytes: {
+        if (std::holds_alternative<std::vector<uint8_t>>(val)) {
+          lookup_val = std::get<std::vector<uint8_t>>(val);
+        } else {
+          lookup_val = std::vector<uint8_t>{};
+        }
+        break;
+      }
+      default: break;
+      }
+      auto &col_idx = table->indexes[col_name];
+      auto val_it = col_idx.find(lookup_val);
+      if (val_it != col_idx.end()) {
+        hits = val_it->second;
+      }
+    } else {
+      hits.reserve(64);
+      // dispatch once on type, then raw typed scan — zero variant overhead in the loop
+      switch (col->type) { // big boi
+      case HyperDB::ColumnType::ColumnType_Int8: {
+        auto n = static_cast<int8_t>(needle_i64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->i8[i] == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Int16: {
+        auto n = static_cast<int16_t>(needle_i64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->i16[i] == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Int32: {
+        auto n = static_cast<int32_t>(needle_i64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->i32[i] == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Int64: {
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->i64[i] == needle_i64)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_UInt8: {
+        auto n = static_cast<uint8_t>(needle_u64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->u8[i] == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_UInt16: {
+        auto n = static_cast<uint16_t>(needle_u64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->u16[i] == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_UInt32: {
+        auto n = static_cast<uint32_t>(needle_u64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->u32[i] == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_UInt64: {
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->u64[i] == needle_u64)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Float32: {
+        auto n = static_cast<float>(needle_f64);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (std::fabs(col->f32[i] - n) <= 1e-6f * std::max({1.0f, std::fabs(col->f32[i]), std::fabs(n)}))
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Float64: {
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (std::fabs(col->f64[i] - needle_f64) <= 1e-6 * std::max({1.0, std::fabs(col->f64[i]), std::fabs(needle_f64)}))
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Bool: {
+        bool n = (needle_i64 != 0);
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if ((col->bools[i] != 0) == n)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_String: {
+        for (uint64_t i = 0; i < table->row_count; ++i)
+          if (col->strings[i] == needle_str)
+            hits.push_back(i);
+        break;
+      }
+      case HyperDB::ColumnType::ColumnType_Bytes: {
+        if (std::holds_alternative<std::vector<uint8_t>>(val)) {
+            auto& n = std::get<std::vector<uint8_t>>(val);
+            for (uint64_t i = 0; i < table->row_count; ++i)
+              if (col->bytes[i] == n)
+                hits.push_back(i);
+        }
+        break;
+      }
+      default:
+        break;
+      }
     }
 
     // now build ReadResults for all matching rows.
@@ -1160,12 +1193,12 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
   case HyperDB::ColumnType::ColumnType_Float32: {
     auto n = static_cast<float>(needle_f64);
     for (uint64_t i = 0; i < n_rows; ++i)
-      if (std::fabs(col->f32[i] - n) < 1e-6f) mark(i);
+      if (std::fabs(col->f32[i] - n) <= 1e-6f * std::max({1.0f, std::fabs(col->f32[i]), std::fabs(n)})) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Float64: {
     for (uint64_t i = 0; i < n_rows; ++i)
-      if (std::fabs(col->f64[i] - needle_f64) < 1e-6) mark(i);
+      if (std::fabs(col->f64[i] - needle_f64) <= 1e-6 * std::max({1.0, std::fabs(col->f64[i]), std::fabs(needle_f64)})) mark(i);
     break;
   }
   case HyperDB::ColumnType::ColumnType_Bool: {
@@ -1329,6 +1362,7 @@ void HyperDBManager::ExecDelete(const std::string &table_name,
 
   estimated_size_ -= size_drop;
   table->row_count -= count;
+  table->indexes.clear();
   dirty_ = true;
   if (callback)
     callback(count);
@@ -1391,6 +1425,25 @@ HyperValue HyperDBManager::GetDefaultValue(HyperDB::ColumnType type) {
     case HyperDB::ColumnType::ColumnType_Bytes: return std::vector<uint8_t>{};
     default: return int8_t(0);
     }
+}
+
+void HyperDBManager::RebuildIndexes(TableMirror &table) {
+  table.indexes.clear();
+  for (const auto &col : table.columns) {
+    auto &col_idx = table.indexes[col.name];
+    for (uint64_t i = 0; i < table.row_count; ++i) {
+      col_idx[GetValueAtIndex(col, i)].push_back(i);
+    }
+  }
+}
+
+void HyperDBManager::UpdateIndexesOnWrite(TableMirror &table, uint64_t start_idx, uint64_t end_idx) {
+  for (const auto &col : table.columns) {
+    auto &col_idx = table.indexes[col.name];
+    for (uint64_t i = start_idx; i < end_idx; ++i) {
+      col_idx[GetValueAtIndex(col, i)].push_back(i);
+    }
+  }
 }
 
 flatbuffers::Offset<HyperDB::Database>
@@ -1652,6 +1705,7 @@ void HyperDBManager::DeserializeToMirror(const HyperDB::Database *db) {
   // rebuild table_map for O(1) lookups
   for (size_t i = 0; i < mirror_.tables.size(); ++i) {
     mirror_.table_map[mirror_.tables[i].name] = i;
+    mirror_.tables[i].indexes.clear();
   }
   // we already accumulated the size in 'estimated_size_' during the loops.
   // do not call the locked EstimateMirrorSize() here or we'll deadlock our own open call. life is hard enough as it is.

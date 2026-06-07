@@ -153,9 +153,12 @@ PYBIND11_MODULE(HyperDB, m) {
         });
 
     py::class_<RowData>(m, "RowData", "a single piece of data for a column. it's just a name and a value")
-        .def(py::init<std::string, HyperValue>(),
-             py::arg("name"), py::arg("value"))
-        .def_readwrite("column_name", &RowData::column_name)
+        .def(py::init([](std::string name, HyperValue value) {
+            return RowData(StringPool::Intern(name), value);
+        }), py::arg("name"), py::arg("value"))
+        .def_property("column_name",
+            [](const RowData &self) -> std::string { return std::string(self.column_name); },
+            [](RowData &self, std::string value) { self.column_name = StringPool::Intern(value); })
         .def_readwrite("value", &RowData::value)
         .def("__repr__", [](const RowData &r) {
             std::ostringstream oss;
@@ -273,10 +276,10 @@ PYBIND11_MODULE(HyperDB, m) {
             py::arg("encrypt"), py::arg("password") = "",
             "changes encryption settings. don't lose the password or you're screwed")
         .def("flush_db", &HyperDBManager::FlushDB,
-            py::arg("iterations") = 58253,
+            py::arg("iterations") = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS,
             "saves data to disk IF it's dirty AND the flush interval has elapsed. respects set_flush_interval.")
         .def("force_flush", &HyperDBManager::ForceFlush,
-            py::arg("iterations") = 58253,
+            py::arg("iterations") = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS,
             "saves data to disk NOW. no excuses, no waiting on the interval.")
         .def("set_flush_interval", &HyperDBManager::SetFlushInterval,
             py::arg("ms"),
@@ -394,10 +397,10 @@ PYBIND11_MODULE(HyperDB, m) {
             py::arg("folder"), py::arg("name"), py::arg("password") = "",
             py::arg("shard_limit_bytes") = HyperDBCluster::DEFAULT_SHARD_LIMIT, py::arg("encrypt") = true,
             "opens or creates a cluster in the given folder")
-        .def("flush", &HyperDBCluster::Flush, py::arg("iterations") = 58253,
+        .def("flush", &HyperDBCluster::Flush, py::arg("iterations") = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS,
              "flushes all shards if dirty AND interval elapsed")
         .def("set_flush_interval", &HyperDBCluster::SetFlushInterval, py::arg("ms"))
-        .def("force_flush", &HyperDBCluster::ForceFlush, py::arg("iterations") = 58253,
+        .def("force_flush", &HyperDBCluster::ForceFlush, py::arg("iterations") = HyperDBConstants::DEFAULT_PBKDF2_ITERATIONS,
              "flushes all shards NOW")
         .def("set_encryption", &HyperDBCluster::SetEncryption, py::arg("encrypt"), py::arg("password") = "")
         .def("is_queue_empty", &HyperDBCluster::IsQueueEmpty)
