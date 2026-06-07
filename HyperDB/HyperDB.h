@@ -59,15 +59,7 @@ namespace HyperDBConstants {
   constexpr uint32_t DEFAULT_PBKDF2_ITERATIONS = 58253;
 }
 
-struct StringPool {
-  static std::string_view Intern(const std::string &str) {
-    static std::unordered_set<std::string> pool;
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto [it, inserted] = pool.insert(str);
-    return *it;
-  }
-};
+
 
 using HyperValue = std::variant<int8_t,              // ColumnType::Int8
                                 int16_t,             // ColumnType::Int16
@@ -115,14 +107,8 @@ struct ColumnDef {
 };
 
 struct RowData {
-  std::string_view column_name;
+  std::string column_name;
   HyperValue value;
-
-  RowData() = default;
-  RowData(std::string_view name) : column_name(StringPool::Intern(std::string(name))), value(int8_t(0)) {}
-  RowData(std::string_view name, HyperValue val) : column_name(StringPool::Intern(std::string(name))), value(val) {}
-  RowData(const std::string &name, HyperValue val) : column_name(StringPool::Intern(name)), value(val) {}
-  RowData(const char *name, HyperValue val) : column_name(StringPool::Intern(name)), value(val) {}
 };
 
 using ReadResult = std::vector<RowData>;

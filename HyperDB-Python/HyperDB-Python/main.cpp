@@ -153,12 +153,9 @@ PYBIND11_MODULE(HyperDB, m) {
         });
 
     py::class_<RowData>(m, "RowData", "a single piece of data for a column. it's just a name and a value")
-        .def(py::init([](std::string name, HyperValue value) {
-            return RowData(StringPool::Intern(name), value);
-        }), py::arg("name"), py::arg("value"))
-        .def_property("column_name",
-            [](const RowData &self) -> std::string { return std::string(self.column_name); },
-            [](RowData &self, std::string value) { self.column_name = StringPool::Intern(value); })
+        .def(py::init<std::string, HyperValue>(),
+             py::arg("name"), py::arg("value"))
+        .def_readwrite("column_name", &RowData::column_name)
         .def_readwrite("value", &RowData::value)
         .def("__repr__", [](const RowData &r) {
             std::ostringstream oss;
