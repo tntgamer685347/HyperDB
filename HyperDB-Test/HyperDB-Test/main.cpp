@@ -136,14 +136,14 @@ void RunSoloTests() {
 }
 
 void RunClusterWriteBenchmark() {
-    std::cout << "\n[2] STARTING 500,000 ROW MINI-APOCALYPSE (WRITE BENCHMARK)" << std::endl;
+    std::cout << "\n[2] STARTING 1,000,000 ROW MINI-APOCALYPSE (WRITE BENCHMARK)" << std::endl;
     std::mt19937 rng(static_cast<unsigned int>(std::time(nullptr)));
     HyperDBCluster cluster;
 
     const std::string PWD = "death";
     const std::string FOLDER = "death_benchmark";
     const size_t SHARD_LIMIT = 512ULL * 1024 * 1024;
-    const int TOTAL_ROWS = 500000;
+    const int TOTAL_ROWS = 1000000;
 
     std::cout << "  " << get_time_stamp() << " target: scale-out write..." << std::endl;
 
