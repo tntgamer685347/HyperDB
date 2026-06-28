@@ -43,6 +43,18 @@ jobs:
             python_lib_name: HyperDB.so
             test_exe: HyperDB-Test
 
+          # Native Linux ARM64 (aarch64) on GitHub's free arm64 hosted runner.
+          # Produces an aarch64 libHyperDB.a so downstreams (e.g. HyperAuth) can
+          # build a linux-arm64 server. All sources are portable; the generic
+          # matrix steps + the Ubuntu python3-dev install work unchanged here.
+          - os: ubuntu-24.04-arm
+            c_compiler: gcc
+            cpp_compiler: g++
+            platform: linux-gcc-arm64
+            lib_name: libHyperDB.a
+            python_lib_name: HyperDB.so
+            test_exe: HyperDB-Test
+
     steps:
     - uses: actions/checkout@v4
 
