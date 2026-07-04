@@ -103,7 +103,12 @@ HyperDBQueue::HyperDBQueue(HyperDBManager *manager) : manager_(manager) {
   worker_thread_ = std::thread(&HyperDBQueue::ProcessQueue, this);
 }
 
-HyperDBQueue::~HyperDBQueue() {
+HyperDBQueue::~HyperDBQueue() { Shutdown(); }
+
+void HyperDBQueue::Shutdown() {
+  // idempotent: joinable() is false once we've already joined, so a second
+  // call (e.g. ~HyperDBQueue after ~HyperDBManager already called us) is a
+  // harmless no-op.
   stop_worker_ = true;
   cv_.notify_all();
   if (worker_thread_.joinable())
@@ -375,10 +380,18 @@ void HyperDBManager::SetEncryption(bool encrypt, const std::string &password) {
 }
 
 HyperDBManager::~HyperDBManager() {
+  // STOP THE WORKER FIRST. queue_ is declared before mirror_/data_mutex_, so
+  // C++ destroys those data members BEFORE ~HyperDBQueue would otherwise join
+  // the worker — and a worker still draining a non-empty queue (Exec* touch
+  // mirror_ + data_mutex_) would read freed memory (heap-use-after-free, seen
+  // under concurrent load + a manager destroyed with pending ops). Joining here,
+  // in the destructor body, guarantees the worker is done while every member is
+  // still alive.
+  queue_.Shutdown();
+
   // password lives in std::string memory; std::string's destructor releases
   // the allocation but does NOT wipe it first. zero it here before member
-  // destructors run. the queue worker doesn't touch password_, so this is
-  // safe to do while it's still alive (it joins via ~HyperDBQueue after).
+  // destructors run. (worker is already joined above, so this is safe.)
   if (!password_.empty())
     SecureZero(password_.data(), password_.size());
 }

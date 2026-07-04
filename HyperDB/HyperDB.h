@@ -210,6 +210,13 @@ public:
   void AddToQueue(QueueEntry entry);
   bool IsEmpty();
 
+  // Stop and join the worker thread. Idempotent. MUST be called by the owning
+  // HyperDBManager's destructor BEFORE the manager's data members (mirror_,
+  // data_mutex_, ...) are torn down — otherwise the still-running worker can
+  // touch freed memory (heap-use-after-free). ~HyperDBQueue also calls this as
+  // a backstop.
+  void Shutdown();
+
 private:
   void ProcessQueue();
   void Execute(QueueEntry entry);
